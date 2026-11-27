@@ -2150,6 +2150,27 @@ private theorem drvFillStrideLoop_targetsIn (loopLbl doneLbl : String) (off : In
       targetsIn_cons_j, List.nil_append, List.mem_cons, List.not_mem_nil, or_false] at ht ⊢
     exact ht.symm
 
+private theorem drvRomStoresAsm_allInstrs (romBase : Int) (bs : List UInt8) :
+    allInstrs (drvRomStoresAsm romBase bs) = true := by
+  have hsw : ∀ (r : Reg) (slots : List Nat), allInstrs (slots.map fun (s : Nat) =>
+      Asm.sw AbiReg.t0 r (BitVec.ofInt 12 (4 * Int.ofNat s - 2048))) = true := by
+    intro r slots
+    induction slots with
+    | nil => rfl
+    | cons _ _ ih =>
+      rw [List.map_cons, allInstrs_cons, Bool.and_eq_true]
+      exact ⟨rfl, ih⟩
+  dsimp only [drvRomStoresAsm]
+  refine allInstrs_flatMap fun ⟨ws, ci⟩ _ => ?_
+  dsimp only [drvRomChunkAsm]
+  rw [allInstrs_append, Bool.and_eq_true]
+  refine ⟨addImmOff_allInstrs _ _ _ _, allInstrs_flatMap fun ⟨v, slots⟩ _ => ?_⟩
+  dsimp only [drvRomGroupAsm]
+  split
+  · exact hsw AbiReg.zero slots
+  · rw [allInstrs_append, Bool.and_eq_true]
+    exact ⟨allInstrs_map_instr _, hsw AbiReg.t1 slots⟩
+
 private theorem drvInitSubAsm_targetsIn (tab : Tab) :
     ∀ t ∈ targetsIn (drvInitSubAsm tab), t ∈ lblNames (drvInitSubAsm tab) := by
   have hbufBT : targetsIn (List.flatMap (fun p =>
@@ -2162,12 +2183,8 @@ private theorem drvInitSubAsm_targetsIn (tab : Tab) :
       (List.range tab.nbuf)) = [] := by
     rw [targetsIn_flatMap, List.flatMap_eq_nil_iff]
     intro _ _; exact targetsIn_of_allInstrs (storeMemOff_allInstrs _ _ _ _ _)
-  have hromT : targetsIn (List.flatMap (fun (w, i) =>
-      li AbiReg.t1 w ++ storeMemOff .sd AbiReg.gp AbiReg.t1 AbiReg.t0 (tab.romBase + 8 * (i : Int)))
-      (romWords64 tab.rom).zipIdx) = [] := by
-    rw [targetsIn_flatMap, List.flatMap_eq_nil_iff]
-    intro ⟨_, _⟩ _; simp [targetsIn_append, targetsIn_of_allInstrs (li_allInstrs _ _),
-      targetsIn_of_allInstrs (storeMemOff_allInstrs _ _ _ _ _)]
+  have hromT : targetsIn (drvRomStoresAsm tab.romBase tab.rom) = [] :=
+    targetsIn_of_allInstrs (drvRomStoresAsm_allInstrs _ _)
   intro t ht
   dsimp only [drvInitSubAsm] at ht ⊢
   simp only [targetsIn_append, hbufBT, hbufLT, hromT,

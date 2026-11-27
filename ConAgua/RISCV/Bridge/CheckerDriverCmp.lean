@@ -1387,12 +1387,16 @@ theorem linkedCmpRom_accept_no_False.{w_u} (V : Type w_u) [ConLeche.SetTheory V]
 
 private theorem defaultCheckerCmpImage_cmpEntryPc :
     defaultCheckerCmpImage.cmpEntryPc = checkerCmpEntryPc := by
-  dsimp only [defaultCheckerCmpImage, LinkedCmpImage.cmpEntryPc, LinkedCmpImage.cmpEntryWord,
-    checkerCmpEntryPc, checkerCmpEntryWord]
+  unfold LinkedCmpImage.cmpEntryPc LinkedCmpImage.cmpEntryWord checkerCmpEntryPc checkerCmpEntryWord
+  have hl : defaultCheckerCmpImage.lkm = checkerLM := by
+    unfold defaultCheckerCmpImage; rfl
+  rw [hl]
 
 private theorem defaultCheckerCmpImage_rom :
     defaultCheckerCmpImage.rom = checkerRom := by
-  dsimp only [defaultCheckerCmpImage, LinkedCmpImage.rom, checkerRom]
+  change RV64.romOfArray defaultCheckerCmpImage.code = RV64.romOfArray checkerCode
+  have hc : defaultCheckerCmpImage.code = checkerCode := rfl
+  rw [hc]
 
 /-- Any accepting return `(acceptWord, 0)` of `checkerRom` from boot state `initSt` yields
     `CmpAccSSzMini (fun _ => abiWords) (abiFuel - 1) checkerProgMini chalBytes solBytes pins`. -/

@@ -1561,6 +1561,27 @@ theorem drvFillStrideLoop_noT6Branch (loopLbl doneLbl : String) (off : Int)
       noT6Branch_of_allInstrs (li_allInstrs _ _), true_and, and_true]
     exact ⟨rfl, rfl⟩
 
+private theorem drvRomStoresAsm_allInstrs (romBase : Int) (bs : List UInt8) :
+    allInstrs (drvRomStoresAsm romBase bs) = true := by
+  have hsw : ∀ (r : Reg) (slots : List Nat), allInstrs (slots.map fun (s : Nat) =>
+      Asm.sw AbiReg.t0 r (BitVec.ofInt 12 (4 * Int.ofNat s - 2048))) = true := by
+    intro r slots
+    induction slots with
+    | nil => rfl
+    | cons _ _ ih =>
+      rw [List.map_cons, allInstrs_cons, Bool.and_eq_true]
+      exact ⟨rfl, ih⟩
+  dsimp only [drvRomStoresAsm]
+  refine allInstrs_flatMap fun ⟨ws, ci⟩ _ => ?_
+  dsimp only [drvRomChunkAsm]
+  rw [allInstrs_append, Bool.and_eq_true]
+  refine ⟨addImmOff_allInstrs _ _ _ _, allInstrs_flatMap fun ⟨v, slots⟩ _ => ?_⟩
+  dsimp only [drvRomGroupAsm]
+  split
+  · exact hsw AbiReg.zero slots
+  · rw [allInstrs_append, Bool.and_eq_true]
+    exact ⟨allInstrs_map_instr _, hsw AbiReg.t1 slots⟩
+
 theorem drvInitSubAsm_noT6Branch (tab : Tab) :
     noT6Branch (drvInitSubAsm tab) = true := by
   dsimp only [drvInitSubAsm]
@@ -1572,13 +1593,8 @@ theorem drvInitSubAsm_noT6Branch (tab : Tab) :
       storeMemOff .sd AbiReg.gp (if p == 0 then AbiReg.a1 else AbiReg.a3) AbiReg.t0 (tab.dlen p))
       (List.range tab.nbuf)) = true :=
     noT6Branch_flatMap (fun _ _ => noT6Branch_of_allInstrs (storeMemOff_allInstrs _ _ _ _ _))
-  have hrom : noT6Branch (List.flatMap (fun (w, i) =>
-      li AbiReg.t1 w ++ storeMemOff .sd AbiReg.gp AbiReg.t1 AbiReg.t0 (tab.romBase + 8 * (i : Int)))
-      (romWords64 tab.rom).zipIdx) = true :=
-    noT6Branch_flatMap (fun ⟨_, _⟩ _ => by
-      simp only [noT6Branch_append, Bool.and_eq_true,
-        noT6Branch_of_allInstrs (li_allInstrs _ _),
-        noT6Branch_of_allInstrs (storeMemOff_allInstrs _ _ _ _ _), and_self])
+  have hrom : noT6Branch (drvRomStoresAsm tab.romBase tab.rom) = true :=
+    noT6Branch_of_allInstrs (drvRomStoresAsm_allInstrs _ _)
   simp only [noT6Branch_append, Bool.and_eq_true,
     noT6Branch_of_allInstrs (li_allInstrs _ _),
     drvFillConstLoop_noT6Branch, drvFillStrideLoop_noT6Branch,

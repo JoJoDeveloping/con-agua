@@ -182,6 +182,27 @@ theorem drvFillStrideLoop_lblNames_eq (loopLbl doneLbl : String) (off : Int)
       lblNames_of_allInstrs (li_allInstrs _ _), List.nil_append]
     rfl
 
+private theorem drvRomStoresAsm_allInstrs (romBase : Int) (bs : List UInt8) :
+    allInstrs (drvRomStoresAsm romBase bs) = true := by
+  have hsw : ∀ (r : Reg) (slots : List Nat), allInstrs (slots.map fun (s : Nat) =>
+      Asm.sw AbiReg.t0 r (BitVec.ofInt 12 (4 * Int.ofNat s - 2048))) = true := by
+    intro r slots
+    induction slots with
+    | nil => rfl
+    | cons _ _ ih =>
+      rw [List.map_cons, allInstrs_cons, Bool.and_eq_true]
+      exact ⟨rfl, ih⟩
+  dsimp only [drvRomStoresAsm]
+  refine allInstrs_flatMap fun ⟨ws, ci⟩ _ => ?_
+  dsimp only [drvRomChunkAsm]
+  rw [allInstrs_append, Bool.and_eq_true]
+  refine ⟨addImmOff_allInstrs _ _ _ _, allInstrs_flatMap fun ⟨v, slots⟩ _ => ?_⟩
+  dsimp only [drvRomGroupAsm]
+  split
+  · exact hsw AbiReg.zero slots
+  · rw [allInstrs_append, Bool.and_eq_true]
+    exact ⟨allInstrs_map_instr _, hsw AbiReg.t1 slots⟩
+
 theorem drvInitSubAsm_lblNames_eq (tab : Tab) :
     lblNames (drvInitSubAsm tab) =
       [drvInitLabel] ++
@@ -201,13 +222,8 @@ theorem drvInitSubAsm_lblNames_eq (tab : Tab) :
       (List.range tab.nbuf)) = [] := by
     rw [lblNames_flatMap, List.flatMap_eq_nil_iff]
     intro _ _; exact lblNames_of_allInstrs (storeMemOff_allInstrs _ _ _ _ _)
-  have hrom : lblNames (List.flatMap (fun (w, i) =>
-      li AbiReg.t1 w ++ storeMemOff .sd AbiReg.gp AbiReg.t1 AbiReg.t0 (tab.romBase + 8 * (i : Int)))
-      (romWords64 tab.rom).zipIdx) = [] := by
-    rw [lblNames_flatMap, List.flatMap_eq_nil_iff]
-    intro ⟨_, _⟩ _
-    simp only [lblNames_append, lblNames_of_allInstrs (li_allInstrs _ _),
-      lblNames_of_allInstrs (storeMemOff_allInstrs _ _ _ _ _), List.nil_append]
+  have hrom : lblNames (drvRomStoresAsm tab.romBase tab.rom) = [] :=
+    lblNames_of_allInstrs (drvRomStoresAsm_allInstrs _ _)
   dsimp only [drvInitSubAsm]
   simp only [lblNames_append, hbufB, hbufL, hrom,
     drvFillStrideLoop_lblNames_eq, drvFillConstLoop_lblNames_eq,

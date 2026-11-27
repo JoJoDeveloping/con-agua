@@ -1419,158 +1419,628 @@ theorem drvFillStrideLoop_sim_gen {lkm : LinkModel} (env : CodeEnvGen lkm)
     · intro i hi
       simpa only [Nat.zero_add] using hvalLoop i hi
 
-private theorem drvRomStoresGo_sim_gen {lkm : LinkModel} (env : CodeEnvGen lkm)
-    (regionBase : BitVec 64)
-    (hRegAlign : isAligned regionBase 8 = true)
+private theorem storeBytes_apply_lt_4 (m : ByteMem) (addr : BitVec 64) :
+    ∀ (n : Nat) (v : BitVec (8 * n)) (k : Nat), k < n → n ≤ 4 →
+      RV64.storeBytes m addr n v (addr + BitVec.ofNat 64 k) = v.extractLsb' (8 * k) 8
+  | 0, _, _, hk, _ => by omega
+  | n + 1, v, 0, _, _ => by
+    have hz : BitVec.ofNat 64 0 = 0#64 := rfl
+    rw [hz, BitVec.add_zero, Nat.mul_zero]
+    simp only [RV64.storeBytes]
+    have hne : ∀ i, i < n → addr ≠ (addr + 1#64) + BitVec.ofNat 64 i := by
+      intro i hi heq
+      have hadd : addr + BitVec.ofNat 64 (1 + i) = (addr + 1#64) + BitVec.ofNat 64 i := by
+        rw [BitVec.add_assoc]; congr 1; rw [BitVec.ofNat_add]
+      rw [← hadd] at heq
+      have hsub := congrArg (· - addr) heq
+      rw [BitVec.sub_self, BitVec.add_comm addr, BitVec.add_sub_cancel] at hsub
+      have h2 := congrArg BitVec.toNat hsub
+      simp only [BitVec.toNat_ofNat, Nat.zero_mod] at h2
+      rw [Nat.mod_eq_of_lt (by omega)] at h2
+      omega
+    rw [storeBytes_apply_ne _ (addr + 1#64) n _ addr hne]
+    simp
+  | n + 1, v, k + 1, hk, hn => by
+    have hadd : addr + BitVec.ofNat 64 (k + 1) = (addr + 1#64) + BitVec.ofNat 64 k := by
+      rw [BitVec.add_assoc]; congr 1; rw [BitVec.ofNat_add, BitVec.add_comm]
+    simp only [RV64.storeBytes]
+    rw [hadd, storeBytes_apply_lt_4 _ (addr + 1#64) n (v.extractLsb' 8 (8 * n)) k (by omega) (by omega)]
+    apply BitVec.eq_of_getLsbD_eq
+    intro i hi
+    simp only [BitVec.getLsbD_extractLsb', show i < 8 from hi, decide_true, Bool.true_and,
+      show 8 * k + i < 8 * n by omega,
+      show 8 + (8 * k + i) = 8 * (k + 1) + i by omega]
+
+private theorem extractLsb32_signExtend_64 (v : BitVec 32) :
+    (v.signExtend 64).extractLsb' 0 32 = v := by
+  apply BitVec.eq_of_getLsbD_eq
+  intro i hi
+  simp only [BitVec.getLsbD_extractLsb', show i < 32 from hi, decide_true, Bool.true_and,
+    Nat.zero_add, BitVec.getLsbD_signExtend, show i < 64 by omega, ↓reduceIte]
+
+private theorem instr_map_totalSize (lkm : LinkModel) (xs : List Instr) :
+    lkm.totalSize (xs.map .instr) = xs.length := by
+  induction xs with
+  | nil => simp
+  | cons x xs ih =>
+    simp only [List.map_cons, List.length_cons, lkm.totalSize_cons, lkm.itemSize_instr, ih]
+    omega
+
+private theorem isAligned4_add_nat_mul4 (base : BitVec 64) (hal : isAligned base 8 = true)
+    (off : Nat) (hmul : off % 4 = 0) (hlt : base.toNat + off < 2 ^ 64) :
+    isAligned (base + BitVec.ofNat 64 off) 4 = true := by
+  rw [isAligned8_iff] at hal
+  simp only [isAligned, beq_iff_eq]
+  apply BitVec.eq_of_toNat_eq
+  have hoff64 : off < 2 ^ 64 := by omega
+  rw [BitVec.extractLsb'_toNat, Nat.shiftRight_zero, BitVec.toNat_add, BitVec.toNat_ofNat,
+    Nat.mod_eq_of_lt hoff64, Nat.mod_eq_of_lt hlt]
+  change (base.toNat + off) % 2 ^ 2 = (0#2).toNat
+  have h2 : (2 ^ 2 : Nat) = 4 := rfl
+  have hz : (0#2).toNat = 0 := rfl
+  rw [h2, hz]; omega
+
+private theorem sextImm12_ofInt_fits_local (off : Int) (hfits : fitsImm12Int off = true) :
+    sextImm12 (BitVec.ofInt 12 off) = BitVec.ofInt 64 off := by
+  unfold fitsImm12Int at hfits
+  simp only [Bool.and_eq_true, decide_eq_true_eq] at hfits
+  apply BitVec.eq_of_toInt_eq
+  have hbmod12 : off.bmod (2 ^ 12) = off := by
+    rw [Int.bmod_def]
+    by_cases h0 : 0 ≤ off
+    · have hm : off % ((2 ^ 12 : Nat) : Int) = off := Int.emod_eq_of_lt h0 (by omega)
+      rw [hm]; split <;> omega
+    · have ha : 0 ≤ off + 4096 := by omega
+      have hb : off + 4096 < ((2 ^ 12 : Nat) : Int) := by omega
+      have hm : off % ((2 ^ 12 : Nat) : Int) = off + 4096 := by
+        rw [← Int.emod_eq_of_lt ha hb, Int.add_emod,
+          show (4096 : Int) % ((2 ^ 12 : Nat) : Int) = 0 by decide, Int.add_zero, Int.emod_emod]
+      rw [hm]; split <;> omega
+  have h64 : (BitVec.ofInt 64 off).toInt = off := by
+    rw [BitVec.toInt_ofInt, Int.bmod_def]
+    by_cases h0 : 0 ≤ off
+    · have hm : off % ((2 ^ 64 : Nat) : Int) = off := Int.emod_eq_of_lt h0 (by omega)
+      rw [hm]; split <;> omega
+    · have ha : 0 ≤ off + ((2 ^ 64 : Nat) : Int) := by omega
+      have hb : off + ((2 ^ 64 : Nat) : Int) < ((2 ^ 64 : Nat) : Int) := by omega
+      have hm : off % ((2 ^ 64 : Nat) : Int) = off + ((2 ^ 64 : Nat) : Int) := by
+        rw [← Int.emod_eq_of_lt ha hb, Int.add_emod, Int.emod_self, Int.add_zero, Int.emod_emod]
+      rw [hm]; split <;> omega
+  rw [h64]
+  change ((BitVec.ofInt 12 off).signExtend 64).toInt = off
+  rw [BitVec.toInt_signExtend, Nat.min_eq_right (by decide : 12 ≤ 64), BitVec.toInt_ofInt, hbmod12,
+    hbmod12]
+
+private theorem rom_byte_addr_inj {base : BitVec 64} {romBase p1 p2 b1 b2 : Nat}
+    (hb1 : b1 < 4) (hb2 : b2 < 4)
+    (hlt1 : base.toNat + (romBase + 4 * p1) + 4 ≤ 2 ^ 64)
+    (hlt2 : base.toNat + (romBase + 4 * p2) + 4 ≤ 2 ^ 64)
+    (heq : base + BitVec.ofNat 64 (romBase + 4 * p1) + BitVec.ofNat 64 b1 =
+      base + BitVec.ofNat 64 (romBase + 4 * p2) + BitVec.ofNat 64 b2) :
+    p1 = p2 := by
+  have hcon := congrArg BitVec.toNat heq
+  have h1 : romBase + 4 * p1 < 2 ^ 64 := by omega
+  have h2 : romBase + 4 * p2 < 2 ^ 64 := by omega
+  have hs1 : base.toNat + (romBase + 4 * p1) < 2 ^ 64 := by omega
+  have hs2 : base.toNat + (romBase + 4 * p2) < 2 ^ 64 := by omega
+  have hf1 : base.toNat + (romBase + 4 * p1) + b1 < 2 ^ 64 := by omega
+  have hf2 : base.toNat + (romBase + 4 * p2) + b2 < 2 ^ 64 := by omega
+  have hb1_64 : b1 < 2 ^ 64 := by omega
+  have hb2_64 : b2 < 2 ^ 64 := by omega
+  simp only [BitVec.toNat_add, BitVec.toNat_ofNat,
+    Nat.mod_eq_of_lt h1, Nat.mod_eq_of_lt h2,
+    Nat.mod_eq_of_lt hs1, Nat.mod_eq_of_lt hs2,
+    Nat.mod_eq_of_lt hf1, Nat.mod_eq_of_lt hf2,
+    Nat.mod_eq_of_lt hb1_64, Nat.mod_eq_of_lt hb2_64] at hcon
+  omega
+
+private theorem drvRomSw_step_lm {lkm : LinkModel} (env : CodeEnvGen lkm)
+    (regionBase : BitVec 64) (hRegAlign : isAligned regionBase 8 = true)
     (hReg64 : regionBase.toNat + abiNeed checkerTabMini < 2 ^ 64)
-    (idx : Nat) (ws : List (BitVec 64))
-    (hbound : checkerTabMini.romBase.toNat + 8 * (idx + ws.length) ≤ abiSlot)
+    (ci s : Nat) (hs : s < 1024)
+    (hbound : checkerTabMini.romBase.toNat + 4096 * ci + 4 * s + 4 ≤ abiSlot)
+    (srcReg : Reg) (pre post : List AsmItem)
+    (hlink : lkm.linkSpec (pre ++ [Asm.sw AbiReg.t0 srcReg (BitVec.ofInt 12 (4 * Int.ofNat s - 2048))] ++ post) =
+      .ok (env.code, env.labels))
+    (st : RV64.State) (hpc : st.pc = BitVec.ofNat 64 (4 * lkm.totalSize pre))
+    (ht0 : st.getReg AbiReg.t0 =
+      regionBase + BitVec.ofInt 64 (checkerTabMini.romBase + 4096 * Int.ofNat ci + 2048)) :
+    let addr := regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * s)
+    let st' := { st with
+      pc := BitVec.ofNat 64 (4 * (lkm.totalSize pre + 1))
+      mem := RV64.storeBytes st.mem addr 4 ((st.getReg srcReg).extractLsb' 0 32) }
+    RV64.run env.rom 1 st = .cont st' ∧
+    st'.pc = BitVec.ofNat 64 (4 * (lkm.totalSize pre + 1)) ∧
+    (∀ q, st'.getReg q = st.getReg q) ∧
+    (∀ b, b < 4 → st'.mem (addr + BitVec.ofNat 64 b) =
+      ((st.getReg srcReg).extractLsb' 0 32).extractLsb' (8 * b) 8) ∧
+    (∀ a, (∀ b, b < 4 → a ≠ addr + BitVec.ofNat 64 b) → st'.mem a = st.mem a) ∧
+    MemEqOutside ⟨addr, 4⟩ st.mem st'.mem := by
+  have hNeedEq : abiNeed checkerTabMini = 205 * abiSlot := checkerTabMini_abiNeed_eq
+  have h211 : abiSlot ≤ abiNeed checkerTabMini := by rw [hNeedEq]; simp [abiSlot]
+  have hromNn : 0 ≤ checkerTabMini.romBase := by simp [Tab.romBase]; omega
+  have hromMod : checkerTabMini.romBase.toNat % 8 = 0 := by
+    rw [checkerTabMini_romBase_eq, Int.toNat_natCast]
+  have hfits : fitsImm12Int (4 * Int.ofNat s - 2048) = true := by
+    simp [fitsImm12Int]; omega
+  have hsext : sextImm12 (BitVec.ofInt 12 (4 * Int.ofNat s - 2048)) =
+      BitVec.ofInt 64 (4 * Int.ofNat s - 2048) :=
+    sextImm12_ofInt_fits_local (4 * Int.ofNat s - 2048) hfits
+  have haddrEq : st.getReg AbiReg.t0 + sextImm12 (BitVec.ofInt 12 (4 * Int.ofNat s - 2048)) =
+      regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * s) := by
+    rw [ht0, hsext, BitVec.add_assoc, ← BitVec.ofInt_add]
+    have hromCast : (checkerTabMini.romBase.toNat : Int) = checkerTabMini.romBase :=
+      Int.toNat_of_nonneg hromNn
+    have hint : (checkerTabMini.romBase + 4096 * Int.ofNat ci + 2048) + (4 * Int.ofNat s - 2048) =
+        ((checkerTabMini.romBase.toNat + 4096 * ci + 4 * s : Nat) : Int) := by
+      simp only [Int.ofNat_eq_natCast]; omega
+    rw [hint, BitVec.ofInt_natCast]
+  have hal : isAligned (st.getReg AbiReg.t0 + sextImm12 (BitVec.ofInt 12 (4 * Int.ofNat s - 2048))) 4 = true := by
+    rw [haddrEq]
+    exact isAligned4_add_nat_mul4 regionBase hRegAlign _ (by omega) (by omega)
+  have hpc64 := linkResolved_sub_pc64 env pre
+    [Asm.sw AbiReg.t0 srcReg (BitVec.ofInt 12 (4 * Int.ofNat s - 2048))] post hlink
+  have htw : lkm.totalSize [Asm.sw AbiReg.t0 srcReg (BitVec.ofInt 12 (4 * Int.ofNat s - 2048))] = 1 := by
+    simp [Asm.sw, lkm.itemSize_instr]
+  rw [htw] at hpc64
+  have hstep := step_sw_off_r env pre post AbiReg.t0 srcReg
+    (BitVec.ofInt 12 (4 * Int.ofNat s - 2048)) hlink hpc64 st hpc hal
+  have hpc4 : st.pc + 4#64 = BitVec.ofNat 64 (4 * (lkm.totalSize pre + 1)) :=
+    pc_add_4_ofNat st.pc hpc
+  obtain ⟨hrun, _, hregs⟩ := hstep
+  rw [haddrEq, hpc4] at hrun
+  refine ⟨hrun, rfl, hregs, ?_, ?_, ?_⟩
+  · intro b hb
+    exact storeBytes_apply_lt_4 st.mem _ 4 _ b hb (by decide)
+  · intro a hne
+    exact storeBytes_apply_ne st.mem _ 4 _ a hne
+  · exact MemEqOutside.storeBytes st.mem _ 4 _ fun k hk => ⟨k, hk, rfl⟩
+
+private theorem drvRomSlots_sim_gen {lkm : LinkModel} (env : CodeEnvGen lkm)
+    (regionBase : BitVec 64) (hRegAlign : isAligned regionBase 8 = true)
+    (hReg64 : regionBase.toNat + abiNeed checkerTabMini < 2 ^ 64)
+    (hromBounds : checkerTabMini.romBase.toNat + 8 * checkerTabMini.romWords ≤ abiSlot)
+    (ci : Nat) (v : BitVec 32) (srcReg : Reg) (slots : List Nat)
+    (hnodup : slots.Nodup)
+    (hslots : ∀ s ∈ slots, s < 1024 ∧
+      checkerTabMini.romBase.toNat + 4096 * ci + 4 * s + 4 ≤
+        checkerTabMini.romBase.toNat + 8 * checkerTabMini.romWords)
     (pre post : List AsmItem)
-    (hlink : lkm.linkSpec (pre ++ drvRomStoresGo checkerTabMini.romBase idx ws ++ post) =
+    (hlink : lkm.linkSpec (pre ++
+        (slots.map fun s => Asm.sw AbiReg.t0 srcReg (BitVec.ofInt 12 (4 * Int.ofNat s - 2048))) ++ post) =
+      .ok (env.code, env.labels))
+    (st : RV64.State) (hpc : st.pc = BitVec.ofNat 64 (4 * lkm.totalSize pre))
+    (ht0 : st.getReg AbiReg.t0 =
+      regionBase + BitVec.ofInt 64 (checkerTabMini.romBase + 4096 * Int.ofNat ci + 2048))
+    (hsrc : (st.getReg srcReg).extractLsb' 0 32 = v) :
+    ∃ st',
+      RV64.run env.rom slots.length st = .cont st' ∧
+      st'.pc = BitVec.ofNat 64 (4 * (lkm.totalSize pre +
+        lkm.totalSize (slots.map fun s => Asm.sw AbiReg.t0 srcReg (BitVec.ofInt 12 (4 * Int.ofNat s - 2048))))) ∧
+      (∀ q, st'.getReg q = st.getReg q) ∧
+      MemEqOutside ⟨regionBase + BitVec.ofNat 64 checkerTabMini.romBase.toNat, 8 * checkerTabMini.romWords⟩
+        st.mem st'.mem ∧
+      (∀ s ∈ slots, ∀ b, b < 4 →
+        st'.mem (regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * s) +
+          BitVec.ofNat 64 b) = v.extractLsb' (8 * b) 8) ∧
+      (∀ a, (∀ s ∈ slots, ∀ b, b < 4 →
+        a ≠ regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * s) +
+          BitVec.ofNat 64 b) → st'.mem a = st.mem a) := by
+  have hNeedEq : abiNeed checkerTabMini = 205 * abiSlot := checkerTabMini_abiNeed_eq
+  have h211 : abiSlot ≤ abiNeed checkerTabMini := by rw [hNeedEq]; simp [abiSlot]
+  induction slots generalizing pre st with
+  | nil =>
+    exact ⟨st, rfl, by simp [hpc], fun _ => rfl, MemEqOutside.refl _ _,
+      fun s hs => by simp at hs, fun _ _ => rfl⟩
+  | cons s rest ih =>
+    rw [List.nodup_cons] at hnodup
+    obtain ⟨hsNotIn, hnodupR⟩ := hnodup
+    obtain ⟨hs1024, hsBnd⟩ := hslots s (List.mem_cons_self ..)
+    have hrestBnd : ∀ s' ∈ rest, s' < 1024 ∧
+        checkerTabMini.romBase.toNat + 4096 * ci + 4 * s' + 4 ≤
+          checkerTabMini.romBase.toNat + 8 * checkerTabMini.romWords :=
+      fun s' hm => hslots s' (List.mem_cons_of_mem _ hm)
+    let cSw := Asm.sw AbiReg.t0 srcReg (BitVec.ofInt 12 (4 * Int.ofNat s - 2048))
+    let cRest := rest.map fun s' => Asm.sw AbiReg.t0 srcReg (BitVec.ofInt 12 (4 * Int.ofNat s' - 2048))
+    have hl1 : lkm.linkSpec (pre ++ [cSw] ++ (cRest ++ post)) = .ok (env.code, env.labels) := by
+      simpa only [cSw, cRest, List.map_cons, List.cons_append, List.nil_append, List.append_assoc] using hlink
+    obtain ⟨hrun1, hpc1, hregs1, hbytes1, hne1, hout1⟩ :=
+      drvRomSw_step_lm env regionBase hRegAlign hReg64 ci s hs1024 (by omega) srcReg pre (cRest ++ post)
+        hl1 st hpc ht0
+    let s1 := { st with
+      pc := BitVec.ofNat 64 (4 * (lkm.totalSize pre + 1))
+      mem := RV64.storeBytes st.mem
+        (regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * s)) 4
+        ((st.getReg srcReg).extractLsb' 0 32) }
+    let p1 := pre ++ [cSw]
+    have htw1 : lkm.totalSize [cSw] = 1 := by simp [cSw, Asm.sw, lkm.itemSize_instr]
+    have hpc1' : s1.pc = BitVec.ofNat 64 (4 * lkm.totalSize p1) := by
+      rw [hpc1]; simp only [p1, lkm.totalSize_append, htw1]
+    have hlR : lkm.linkSpec (p1 ++ cRest ++ post) = .ok (env.code, env.labels) := by
+      simpa only [p1, List.append_assoc] using hl1
+    obtain ⟨s2, hrunR, hpcR, hregsR, houtR, hbytesR, hneR⟩ :=
+      ih hnodupR hrestBnd p1 hlR s1 hpc1' ((hregs1 _).trans ht0) (by rw [hregs1, hsrc])
+    have hout1' : MemEqOutside ⟨regionBase + BitVec.ofNat 64 checkerTabMini.romBase.toNat,
+        8 * checkerTabMini.romWords⟩ st.mem s1.mem := by
+      apply MemEqOutside.mono _ hout1
+      intro a ⟨k, hk, ha⟩
+      dsimp only [MemSpan.contains] at hk ⊢
+      refine ⟨4096 * ci + 4 * s + k, by omega, ?_⟩
+      rw [ha]
+      apply BitVec.eq_of_toNat_eq
+      simp only [BitVec.toNat_add, BitVec.toNat_ofNat]
+      have ha1 : checkerTabMini.romBase.toNat + 4096 * ci + 4 * s < 2 ^ 64 := by omega
+      have ha2 : 4096 * ci + 4 * s + k < 2 ^ 64 := by omega
+      have ha3 : checkerTabMini.romBase.toNat < 2 ^ 64 := by omega
+      have ha4 : k < 2 ^ 64 := by omega
+      have hb1 : regionBase.toNat + (checkerTabMini.romBase.toNat + 4096 * ci + 4 * s) < 2 ^ 64 := by omega
+      have hb2 : regionBase.toNat + checkerTabMini.romBase.toNat < 2 ^ 64 := by omega
+      rw [Nat.mod_eq_of_lt ha1, Nat.mod_eq_of_lt ha2, Nat.mod_eq_of_lt ha3, Nat.mod_eq_of_lt ha4,
+        Nat.mod_eq_of_lt hb1, Nat.mod_eq_of_lt hb2]
+      exact congrArg (· % 2 ^ 64) (by omega)
+    refine ⟨s2, by rw [List.length_cons, Nat.add_comm rest.length 1, run_add, hrun1]; exact hrunR, ?_,
+      fun q => (hregsR q).trans (hregs1 q), hout1'.trans houtR, ?_, ?_⟩
+    · rw [hpcR]
+      simp only [p1, List.map_cons, lkm.totalSize_append, lkm.totalSize_cons, lkm.totalSize_nil, cSw,
+        Asm.sw, lkm.itemSize_instr, Nat.zero_add, Nat.add_assoc]
+    · intro s0 hs0 b hb
+      rcases List.mem_cons.mp hs0 with rfl | hs0'
+      · have hnotR : ∀ s' ∈ rest, ∀ b', b' < 4 →
+            regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * s0) + BitVec.ofNat 64 b ≠
+              regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * s') + BitVec.ofNat 64 b' := by
+          intro s' hm' b' hb' heq
+          have hneS : s0 ≠ s' := fun h => hsNotIn (h ▸ hm')
+          have ⟨_, hs'Bnd⟩ := hrestBnd s' hm'
+          have hidx := rom_byte_addr_inj hb hb'
+            (by omega : regionBase.toNat + (checkerTabMini.romBase.toNat + 4 * (1024 * ci + s0)) + 4 ≤ 2 ^ 64)
+            (by omega : regionBase.toNat + (checkerTabMini.romBase.toNat + 4 * (1024 * ci + s')) + 4 ≤ 2 ^ 64)
+            (by simpa only [show checkerTabMini.romBase.toNat + 4096 * ci + 4 * s0 =
+                checkerTabMini.romBase.toNat + 4 * (1024 * ci + s0) by omega,
+              show checkerTabMini.romBase.toNat + 4096 * ci + 4 * s' =
+                checkerTabMini.romBase.toNat + 4 * (1024 * ci + s') by omega] using heq)
+          omega
+        rw [hneR _ hnotR, hbytes1 b hb, hsrc]
+      · exact hbytesR s0 hs0' b hb
+    · intro a hne
+      rw [hneR a (fun s' hm' => hne s' (List.mem_cons_of_mem _ hm')),
+        hne1 a (hne s (List.mem_cons_self ..))]
+
+private theorem drvRomGroup_sim_gen {lkm : LinkModel} (env : CodeEnvGen lkm)
+    (regionBase : BitVec 64) (hRegAlign : isAligned regionBase 8 = true)
+    (hReg64 : regionBase.toNat + abiNeed checkerTabMini < 2 ^ 64)
+    (hromBounds : checkerTabMini.romBase.toNat + 8 * checkerTabMini.romWords ≤ abiSlot)
+    (ci : Nat) (g : BitVec 32 × List Nat)
+    (hnodup : g.2.Nodup)
+    (hslots : ∀ s ∈ g.2, s < 1024 ∧
+      checkerTabMini.romBase.toNat + 4096 * ci + 4 * s + 4 ≤
+        checkerTabMini.romBase.toNat + 8 * checkerTabMini.romWords)
+    (pre post : List AsmItem)
+    (hlink : lkm.linkSpec (pre ++ drvRomGroupAsm g ++ post) = .ok (env.code, env.labels))
+    (st : RV64.State) (hpc : st.pc = BitVec.ofNat 64 (4 * lkm.totalSize pre))
+    (ht0 : st.getReg AbiReg.t0 =
+      regionBase + BitVec.ofInt 64 (checkerTabMini.romBase + 4096 * Int.ofNat ci + 2048)) :
+    ∃ k st',
+      RV64.run env.rom k st = .cont st' ∧
+      st'.pc = BitVec.ofNat 64 (4 * (lkm.totalSize pre + lkm.totalSize (drvRomGroupAsm g))) ∧
+      (∀ q, q ≠ AbiReg.t1 → st'.getReg q = st.getReg q) ∧
+      MemEqOutside ⟨regionBase + BitVec.ofNat 64 checkerTabMini.romBase.toNat, 8 * checkerTabMini.romWords⟩
+        st.mem st'.mem ∧
+      (∀ s ∈ g.2, ∀ b, b < 4 →
+        st'.mem (regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * s) +
+          BitVec.ofNat 64 b) = g.1.extractLsb' (8 * b) 8) ∧
+      (∀ a, (∀ s ∈ g.2, ∀ b, b < 4 →
+        a ≠ regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * s) +
+          BitVec.ofNat 64 b) → st'.mem a = st.mem a) := by
+  rcases g with ⟨v, slots⟩
+  dsimp only [drvRomGroupAsm] at hlink ⊢
+  by_cases hv0 : v == 0#32
+  · simp only [hv0, ↓reduceIte] at hlink ⊢
+    have hvEq : v = 0#32 := beq_iff_eq.mp hv0
+    subst hvEq
+    obtain ⟨st', hrun, hpc', hregs, hout, hbytes, hne⟩ :=
+      drvRomSlots_sim_gen env regionBase hRegAlign hReg64 hromBounds ci 0#32 AbiReg.zero slots
+        hnodup hslots pre post hlink st hpc ht0 rfl
+    exact ⟨slots.length, st', hrun, hpc', fun q _ => hregs q, hout, hbytes, hne⟩
+  · simp only [hv0, Bool.false_eq_true, ↓reduceIte] at hlink ⊢
+    let cLi := (li32Instrs AbiReg.t1 v).map AsmItem.instr
+    let cSws := slots.map fun s => Asm.sw AbiReg.t0 AbiReg.t1 (BitVec.ofInt 12 (4 * Int.ofNat s - 2048))
+    have hl1 : lkm.linkSpec (pre ++ cLi ++ (cSws ++ post)) = .ok (env.code, env.labels) := by
+      simpa only [cLi, cSws, List.append_assoc] using hlink
+    have hpc64 := linkResolved_sub_pc64 env pre cLi (cSws ++ post) hl1
+    rw [instr_map_totalSize] at hpc64
+    obtain ⟨s1, hrun1, hoth1, ht1_1, hm1, hpc1⟩ :=
+      li32Instrs_eval_lm lkm env.hrom pre (cSws ++ post) AbiReg.t1 (by decide) v hl1 hpc64 st hpc
+    let p1 := pre ++ cLi
+    have hpc1' : s1.pc = BitVec.ofNat 64 (4 * lkm.totalSize p1) := by
+      rw [hpc1]; simp only [p1, cLi, lkm.totalSize_append, instr_map_totalSize]
+    have hs1t0 : s1.getReg AbiReg.t0 =
+        regionBase + BitVec.ofInt 64 (checkerTabMini.romBase + 4096 * Int.ofNat ci + 2048) :=
+      (hoth1 _ (by decide)).trans ht0
+    have hl2 : lkm.linkSpec (p1 ++ cSws ++ post) = .ok (env.code, env.labels) := by
+      simpa only [p1, List.append_assoc] using hl1
+    obtain ⟨s2, hrun2, hpc2, hregs2, hout2, hbytes2, hne2⟩ :=
+      drvRomSlots_sim_gen env regionBase hRegAlign hReg64 hromBounds ci v AbiReg.t1 slots
+        hnodup hslots p1 post hl2 s1 hpc1' hs1t0 (by rw [ht1_1]; exact extractLsb32_signExtend_64 v)
+    refine ⟨(li32Instrs AbiReg.t1 v).length + slots.length, s2,
+      by rw [run_add, hrun1]; exact hrun2, ?_,
+      fun q hq => (hregs2 q).trans (hoth1 q hq), by rw [← hm1]; exact hout2, hbytes2,
+      fun a ha => by rw [← hm1]; exact hne2 a ha⟩
+    rw [hpc2]; simp only [p1, cLi, lkm.totalSize_append, instr_map_totalSize, Nat.add_assoc]
+
+private theorem drvRomGroups_sim_gen {lkm : LinkModel} (env : CodeEnvGen lkm)
+    (regionBase : BitVec 64) (hRegAlign : isAligned regionBase 8 = true)
+    (hReg64 : regionBase.toNat + abiNeed checkerTabMini < 2 ^ 64)
+    (hromBounds : checkerTabMini.romBase.toNat + 8 * checkerTabMini.romWords ≤ abiSlot)
+    (ci : Nat) (gs : List (BitVec 32 × List Nat))
+    (hnodup : ((romGroupPairs gs).map Prod.fst).Nodup)
+    (hslots : ∀ p ∈ romGroupPairs gs, p.1 < 1024 ∧
+      checkerTabMini.romBase.toNat + 4096 * ci + 4 * p.1 + 4 ≤
+        checkerTabMini.romBase.toNat + 8 * checkerTabMini.romWords)
+    (pre post : List AsmItem)
+    (hlink : lkm.linkSpec (pre ++ gs.flatMap drvRomGroupAsm ++ post) = .ok (env.code, env.labels))
+    (st : RV64.State) (hpc : st.pc = BitVec.ofNat 64 (4 * lkm.totalSize pre))
+    (ht0 : st.getReg AbiReg.t0 =
+      regionBase + BitVec.ofInt 64 (checkerTabMini.romBase + 4096 * Int.ofNat ci + 2048)) :
+    ∃ k st',
+      RV64.run env.rom k st = .cont st' ∧
+      st'.pc = BitVec.ofNat 64 (4 * (lkm.totalSize pre + lkm.totalSize (gs.flatMap drvRomGroupAsm))) ∧
+      (∀ q, q ≠ AbiReg.t1 → st'.getReg q = st.getReg q) ∧
+      MemEqOutside ⟨regionBase + BitVec.ofNat 64 checkerTabMini.romBase.toNat, 8 * checkerTabMini.romWords⟩
+        st.mem st'.mem ∧
+      (∀ p ∈ romGroupPairs gs, ∀ b, b < 4 →
+        st'.mem (regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * p.1) +
+          BitVec.ofNat 64 b) = p.2.extractLsb' (8 * b) 8) ∧
+      (∀ a, (∀ p ∈ romGroupPairs gs, ∀ b, b < 4 →
+        a ≠ regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * p.1) +
+          BitVec.ofNat 64 b) → st'.mem a = st.mem a) := by
+  have hNeedEq : abiNeed checkerTabMini = 205 * abiSlot := checkerTabMini_abiNeed_eq
+  have h211 : abiSlot ≤ abiNeed checkerTabMini := by rw [hNeedEq]; simp [abiSlot]
+  induction gs generalizing pre st with
+  | nil =>
+    exact ⟨0, st, rfl, by simp [hpc], fun _ _ => rfl, MemEqOutside.refl _ _,
+      fun _ hp => by simp [romGroupPairs] at hp, fun _ _ => rfl⟩
+  | cons g rest ih =>
+    rcases g with ⟨v, slots⟩
+    have hmapFst : ∀ (xs : List Nat), (xs.map fun s => (s, v)).map Prod.fst = xs := fun xs => by
+      induction xs with
+      | nil => rfl
+      | cons s ss ihs => simp [ihs]
+    have hnd : (slots ++ (romGroupPairs rest).map Prod.fst).Nodup := by
+      simpa only [romGroupPairs, List.flatMap_cons, List.map_append, hmapFst slots] using hnodup
+    rw [List.nodup_append] at hnd
+    obtain ⟨hnodupS, hnodupR, hdisjSR⟩ := hnd
+    have hslotsS : ∀ s ∈ slots, s < 1024 ∧
+        checkerTabMini.romBase.toNat + 4096 * ci + 4 * s + 4 ≤
+          checkerTabMini.romBase.toNat + 8 * checkerTabMini.romWords :=
+      fun s hs => hslots (s, v) (by
+        simp only [romGroupPairs, List.flatMap_cons, List.mem_append, List.mem_map]
+        exact Or.inl ⟨s, hs, rfl⟩)
+    have hslotsR : ∀ p ∈ romGroupPairs rest, p.1 < 1024 ∧
+        checkerTabMini.romBase.toNat + 4096 * ci + 4 * p.1 + 4 ≤
+          checkerTabMini.romBase.toNat + 8 * checkerTabMini.romWords :=
+      fun p hp => hslots p (by
+        simp only [romGroupPairs, List.flatMap_cons, List.mem_append]
+        exact Or.inr hp)
+    have hl1 : lkm.linkSpec (pre ++ drvRomGroupAsm (v, slots) ++ (rest.flatMap drvRomGroupAsm ++ post)) =
+        .ok (env.code, env.labels) := by
+      simpa only [List.flatMap_cons, List.append_assoc] using hlink
+    obtain ⟨k1, s1, hrun1, hpc1, hoth1, hout1, hbytes1, hne1⟩ :=
+      drvRomGroup_sim_gen env regionBase hRegAlign hReg64 hromBounds ci (v, slots)
+        hnodupS hslotsS pre (rest.flatMap drvRomGroupAsm ++ post) hl1 st hpc ht0
+    let p1 := pre ++ drvRomGroupAsm (v, slots)
+    have hpc1' : s1.pc = BitVec.ofNat 64 (4 * lkm.totalSize p1) := by
+      rw [hpc1]; simp only [p1, lkm.totalSize_append]
+    have hs1t0 : s1.getReg AbiReg.t0 =
+        regionBase + BitVec.ofInt 64 (checkerTabMini.romBase + 4096 * Int.ofNat ci + 2048) :=
+      (hoth1 _ (by decide)).trans ht0
+    have hlR : lkm.linkSpec (p1 ++ rest.flatMap drvRomGroupAsm ++ post) = .ok (env.code, env.labels) := by
+      simpa only [p1, List.append_assoc] using hl1
+    obtain ⟨k2, s2, hrun2, hpc2, hoth2, hout2, hbytes2, hne2⟩ :=
+      ih hnodupR hslotsR p1 hlR s1 hpc1' hs1t0
+    refine ⟨k1 + k2, s2, by rw [run_add, hrun1]; exact hrun2, ?_,
+      fun q hq => (hoth2 q hq).trans (hoth1 q hq), hout1.trans hout2, ?_, ?_⟩
+    · rw [hpc2]; simp only [p1, List.flatMap_cons, lkm.totalSize_append, Nat.add_assoc]
+    · intro p hp b hb
+      simp only [romGroupPairs, List.flatMap_cons, List.mem_append, List.mem_map] at hp
+      rcases hp with ⟨s0, hs0, rfl⟩ | hpR
+      · have hnotR : ∀ p' ∈ romGroupPairs rest, ∀ b', b' < 4 →
+            regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * s0) + BitVec.ofNat 64 b ≠
+              regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * p'.1) + BitVec.ofNat 64 b' := by
+          intro p' hp' b' hb' heq
+          have hneS : s0 ≠ p'.1 := hdisjSR s0 hs0 p'.1 (List.mem_map.mpr ⟨p', hp', rfl⟩)
+          have ⟨_, hs0Bnd⟩ := hslotsS s0 hs0
+          have ⟨_, hp'Bnd⟩ := hslotsR p' hp'
+          have hidx := rom_byte_addr_inj hb hb'
+            (by omega : regionBase.toNat + (checkerTabMini.romBase.toNat + 4 * (1024 * ci + s0)) + 4 ≤ 2 ^ 64)
+            (by omega : regionBase.toNat + (checkerTabMini.romBase.toNat + 4 * (1024 * ci + p'.1)) + 4 ≤ 2 ^ 64)
+            (by simpa only [show checkerTabMini.romBase.toNat + 4096 * ci + 4 * s0 =
+                checkerTabMini.romBase.toNat + 4 * (1024 * ci + s0) by omega,
+              show checkerTabMini.romBase.toNat + 4096 * ci + 4 * p'.1 =
+                checkerTabMini.romBase.toNat + 4 * (1024 * ci + p'.1) by omega] using heq)
+          omega
+        rw [hne2 _ hnotR, hbytes1 s0 hs0 b hb]
+      · exact hbytes2 p hpR b hb
+    · intro a hne
+      rw [hne2 a (fun p' hp' => hne p' (by
+        simp only [romGroupPairs, List.flatMap_cons, List.mem_append]; exact Or.inr hp')),
+        hne1 a (fun s' hs' => hne (s', v) (by
+        simp only [romGroupPairs, List.flatMap_cons, List.mem_append, List.mem_map]
+        exact Or.inl ⟨s', hs', rfl⟩))]
+
+private theorem drvRomChunk_sim_gen {lkm : LinkModel} (env : CodeEnvGen lkm)
+    (regionBase : BitVec 64) (hRegAlign : isAligned regionBase 8 = true)
+    (hReg64 : regionBase.toNat + abiNeed checkerTabMini < 2 ^ 64)
+    (hromBounds : checkerTabMini.romBase.toNat + 8 * checkerTabMini.romWords ≤ abiSlot)
+    (ci : Nat) (ws : List (BitVec 32))
+    (hwsLe : ws.length ≤ 1024)
+    (hbound : ∀ j, j < ws.length →
+      checkerTabMini.romBase.toNat + 4096 * ci + 4 * j + 4 ≤
+        checkerTabMini.romBase.toNat + 8 * checkerTabMini.romWords)
+    (pre post : List AsmItem)
+    (hlink : lkm.linkSpec (pre ++ drvRomChunkAsm checkerTabMini.romBase ci ws ++ post) =
       .ok (env.code, env.labels))
     (st : RV64.State) (hpc : st.pc = BitVec.ofNat 64 (4 * lkm.totalSize pre))
     (hgp : st.getReg AbiReg.gp = regionBase) :
     ∃ k st',
       RV64.run env.rom k st = .cont st' ∧
       st'.pc = BitVec.ofNat 64 (4 * (lkm.totalSize pre +
-        lkm.totalSize (drvRomStoresGo checkerTabMini.romBase idx ws))) ∧
+        lkm.totalSize (drvRomChunkAsm checkerTabMini.romBase ci ws))) ∧
       (∀ q, q ≠ AbiReg.t0 → q ≠ AbiReg.t1 → st'.getReg q = st.getReg q) ∧
-      MemEqOutside ⟨regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 8 * idx), 8 * ws.length⟩
+      MemEqOutside ⟨regionBase + BitVec.ofNat 64 checkerTabMini.romBase.toNat, 8 * checkerTabMini.romWords⟩
         st.mem st'.mem ∧
-      (∀ (j : Nat) (hj : j < ws.length) (b : Nat), b < 8 →
-        st'.mem (regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 8 * (idx + j)) + BitVec.ofNat 64 b) =
-          ws[j].extractLsb' (8 * b) 8) := by
+      (∀ (j : Nat) (hj : j < ws.length) (b : Nat), b < 4 →
+        st'.mem (regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * j) +
+          BitVec.ofNat 64 b) = ws[j].extractLsb' (8 * b) 8) ∧
+      (∀ a, (∀ (j : Nat), j < ws.length → ∀ b, b < 4 →
+        a ≠ regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * j) +
+          BitVec.ofNat 64 b) → st'.mem a = st.mem a) := by
+  let off := checkerTabMini.romBase + 4096 * Int.ofNat ci + 2048
+  let cAdd := addImmOff AbiReg.t0 AbiReg.gp AbiReg.t1 off
+  let cGrps := (romGroupChunk ws).flatMap drvRomGroupAsm
+  have hl1 : lkm.linkSpec (pre ++ cAdd ++ (cGrps ++ post)) = .ok (env.code, env.labels) := by
+    simpa only [drvRomChunkAsm, cAdd, off, cGrps, List.append_assoc] using hlink
+  have hpc64 := linkResolved_sub_pc64 env pre cAdd (cGrps ++ post) hl1
+  obtain ⟨s1, hrun1, hoth1, ht0_1, hm1, hpc1⟩ :=
+    addImmOff_correct_lm lkm env.hrom pre (cGrps ++ post) AbiReg.t0 AbiReg.gp AbiReg.t1
+      (by decide) (by decide) (by decide) off hl1 hpc64 st hpc
+  let p1 := pre ++ cAdd
+  have hpc1' : s1.pc = BitVec.ofNat 64 (4 * lkm.totalSize p1) := by
+    dsimp only [p1, cAdd]; rw [hpc1, lkm.totalSize_append]
+  have hs1t0 : s1.getReg AbiReg.t0 =
+      regionBase + BitVec.ofInt 64 (checkerTabMini.romBase + 4096 * Int.ofNat ci + 2048) := by
+    rw [ht0_1, hgp]
+  have hl2 : lkm.linkSpec (p1 ++ cGrps ++ post) = .ok (env.code, env.labels) := by
+    simpa only [p1, List.append_assoc] using hl1
+  have hslots : ∀ p ∈ romGroupPairs (romGroupChunk ws), p.1 < 1024 ∧
+      checkerTabMini.romBase.toNat + 4096 * ci + 4 * p.1 + 4 ≤
+        checkerTabMini.romBase.toNat + 8 * checkerTabMini.romWords := by
+    intro p hp
+    obtain ⟨hlt, _, _⟩ := romGroupChunk_mem_lt ws hp
+    exact ⟨by omega, hbound p.1 hlt⟩
+  obtain ⟨k2, s2, hrun2, hpc2, hoth2, hout2, hbytes2, hne2⟩ :=
+    drvRomGroups_sim_gen env regionBase hRegAlign hReg64 hromBounds ci (romGroupChunk ws)
+      (romGroupChunk_nodup ws) hslots p1 post hl2 s1 hpc1' hs1t0
+  refine ⟨lkm.totalSize cAdd + k2, s2, by rw [run_add, hrun1]; exact hrun2, ?_,
+    fun q hq0 hq1 => (hoth2 q hq1).trans (hoth1 q hq0 hq1), by rw [← hm1]; exact hout2, ?_, ?_⟩
+  · rw [hpc2]; simp only [p1, cAdd, off, drvRomChunkAsm, lkm.totalSize_append, Nat.add_assoc]
+  · intro j hj b hb
+    exact hbytes2 (j, ws[j]) (romGroupChunk_mem_of_lt ws j hj) b hb
+  · intro a hne
+    rw [← hm1]
+    exact hne2 a fun p hp b hb => by
+      obtain ⟨hlt, _, _⟩ := romGroupChunk_mem_lt ws hp
+      exact hne p.1 hlt b hb
+
+private theorem drvRomChunks_sim_gen {lkm : LinkModel} (env : CodeEnvGen lkm)
+    (regionBase : BitVec 64) (hRegAlign : isAligned regionBase 8 = true)
+    (hReg64 : regionBase.toNat + abiNeed checkerTabMini < 2 ^ 64)
+    (hromBounds : checkerTabMini.romBase.toNat + 8 * checkerTabMini.romWords ≤ abiSlot)
+    (ci : Nat) (chunks : List (List (BitVec 32)))
+    (hchunks : ∀ ws ∈ chunks, ws.length ≤ 1024)
+    (hbound : ∀ (k : Nat) (hk : k < chunks.length) (j : Nat), j < chunks[k].length →
+      4 * (1024 * (ci + k) + j) + 4 ≤ 8 * checkerTabMini.romWords)
+    (pre post : List AsmItem)
+    (hlink : lkm.linkSpec (pre ++
+        ((chunks.zipIdx ci).flatMap fun (ws, c) => drvRomChunkAsm checkerTabMini.romBase c ws) ++ post) =
+      .ok (env.code, env.labels))
+    (st : RV64.State) (hpc : st.pc = BitVec.ofNat 64 (4 * lkm.totalSize pre))
+    (hgp : st.getReg AbiReg.gp = regionBase) :
+    ∃ k st',
+      RV64.run env.rom k st = .cont st' ∧
+      st'.pc = BitVec.ofNat 64 (4 * (lkm.totalSize pre +
+        lkm.totalSize ((chunks.zipIdx ci).flatMap fun (ws, c) => drvRomChunkAsm checkerTabMini.romBase c ws))) ∧
+      (∀ q, q ≠ AbiReg.t0 → q ≠ AbiReg.t1 → st'.getReg q = st.getReg q) ∧
+      MemEqOutside ⟨regionBase + BitVec.ofNat 64 checkerTabMini.romBase.toNat, 8 * checkerTabMini.romWords⟩
+        st.mem st'.mem ∧
+      (∀ (k : Nat) (hk : k < chunks.length) (j : Nat) (hj : j < chunks[k].length) (b : Nat), b < 4 →
+        st'.mem (regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * (ci + k) + 4 * j) +
+          BitVec.ofNat 64 b) = (chunks[k]'hk)[j].extractLsb' (8 * b) 8) ∧
+      (∀ a, (∀ (k : Nat) (hk : k < chunks.length) (j : Nat), j < chunks[k].length → ∀ b, b < 4 →
+        a ≠ regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * (ci + k) + 4 * j) +
+          BitVec.ofNat 64 b) → st'.mem a = st.mem a) := by
   have hNeedEq : abiNeed checkerTabMini = 205 * abiSlot := checkerTabMini_abiNeed_eq
-  have hromNn : 0 ≤ checkerTabMini.romBase := by simp [Tab.romBase]; omega
-  have hromMod : checkerTabMini.romBase.toNat % 8 = 0 := by
-    have hr : checkerTabMini.romBase = ((16 + 24 * (checkerTabMini.nb + checkerTabMini.nw) : Nat) : Int) := by
-      simp [Tab.romBase]
-    rw [hr, Int.toNat_natCast]; omega
-  induction ws generalizing idx pre st with
+  have h211 : abiSlot ≤ abiNeed checkerTabMini := by rw [hNeedEq]; simp [abiSlot]
+  induction chunks generalizing ci pre st with
   | nil =>
-    exact ⟨0, st, rfl, by simp [drvRomStoresGo, hpc], fun _ _ _ => rfl,
-      MemEqOutside.refl _ _, fun j hj => by simp at hj⟩
-  | cons w rest ih =>
-    let cLi := li AbiReg.t1 w
-    let cSt := storeMemOff .sd AbiReg.gp AbiReg.t1 AbiReg.t0 (checkerTabMini.romBase + 8 * (idx : Int))
-    have hlLi : lkm.linkSpec (pre ++ cLi ++ (cSt ++ drvRomStoresGo checkerTabMini.romBase (idx + 1) rest ++ post)) =
-        .ok (env.code, env.labels) := by
-      simpa only [drvRomStoresGo, cLi, cSt, List.append_assoc] using hlink
-    have hpcLi64 := linkResolved_sub_pc64 env pre cLi _ hlLi
-    obtain ⟨s1, hrun1, hoth1, ht1_1, hm1, hpc1⟩ :=
-      li_correct_lm lkm env.hrom pre _ AbiReg.t1 (by decide) w hlLi hpcLi64 st hpc
-    let p1 := pre ++ cLi
+    exact ⟨0, st, rfl, by simp [hpc], fun _ _ _ => rfl, MemEqOutside.refl _ _,
+      fun k hk => by simp at hk, fun _ _ => rfl⟩
+  | cons ws rest ih =>
+    have hwsLe : ws.length ≤ 1024 := hchunks ws (List.mem_cons_self ..)
+    have hrestLe : ∀ ws' ∈ rest, ws'.length ≤ 1024 := fun ws' hm => hchunks ws' (List.mem_cons_of_mem _ hm)
+    have hwsBnd : ∀ j, j < ws.length →
+        checkerTabMini.romBase.toNat + 4096 * ci + 4 * j + 4 ≤
+          checkerTabMini.romBase.toNat + 8 * checkerTabMini.romWords := by
+      intro j hj
+      have hb := hbound 0 (by simp) j hj
+      omega
+    have hrestBnd : ∀ (k : Nat) (hk : k < rest.length) (j : Nat), j < rest[k].length →
+        4 * (1024 * ((ci + 1) + k) + j) + 4 ≤ 8 * checkerTabMini.romWords := by
+      intro k hk j hj
+      have hb := hbound (k + 1) (by simp; omega) j hj
+      simpa only [show ci + (k + 1) = (ci + 1) + k by omega] using hb
+    let cChunk := drvRomChunkAsm checkerTabMini.romBase ci ws
+    let cRest := (rest.zipIdx (ci + 1)).flatMap fun (ws', c) => drvRomChunkAsm checkerTabMini.romBase c ws'
+    have hl1 : lkm.linkSpec (pre ++ cChunk ++ (cRest ++ post)) = .ok (env.code, env.labels) := by
+      simpa only [cChunk, cRest, List.zipIdx_cons, List.flatMap_cons, List.append_assoc] using hlink
+    obtain ⟨k1, s1, hrun1, hpc1, hoth1, hout1, hbytes1, hne1⟩ :=
+      drvRomChunk_sim_gen env regionBase hRegAlign hReg64 hromBounds ci ws hwsLe hwsBnd
+        pre (cRest ++ post) hl1 st hpc hgp
+    let p1 := pre ++ cChunk
     have hpc1' : s1.pc = BitVec.ofNat 64 (4 * lkm.totalSize p1) := by
-      simpa only [p1, lkm.totalSize_append] using hpc1
-    have hs1gp : s1.getReg AbiReg.gp = regionBase := (hoth1 _ (by decide)).trans hgp
-    have hlSt : lkm.linkSpec (p1 ++ cSt ++ (drvRomStoresGo checkerTabMini.romBase (idx + 1) rest ++ post)) =
-        .ok (env.code, env.labels) := by
-      simpa only [p1, List.append_assoc] using hlLi
-    have hpcSt64 := linkResolved_sub_pc64 env p1 cSt _ hlSt
-    have hIntEq : checkerTabMini.romBase + 8 * (idx : Int) = ((checkerTabMini.romBase.toNat + 8 * idx : Nat) : Int) := by omega
-    have hOffEq : BitVec.ofInt 64 (checkerTabMini.romBase + 8 * (idx : Int)) = BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 8 * idx) := by
-      rw [hIntEq, BitVec.ofInt_natCast]
-    have halSt : isAligned (s1.getReg AbiReg.gp + BitVec.ofInt 64 (checkerTabMini.romBase + 8 * (idx : Int))) 8 = true := by
-      rw [hs1gp, hOffEq]; exact isAligned8_add_nat_mul8 regionBase hRegAlign _ (by omega)
-    obtain ⟨s2, hrun2, hoth2, hm2, hpc2⟩ :=
-      storeMemOff_sd_correct_lm lkm env.hrom p1 _ AbiReg.gp AbiReg.t1 AbiReg.t0
-        (by decide) (by decide) (by decide) (checkerTabMini.romBase + 8 * (idx : Int)) hlSt hpcSt64 s1 hpc1' halSt
-    let p2 := p1 ++ cSt
-    have hpc2' : s2.pc = BitVec.ofNat 64 (4 * lkm.totalSize p2) := by
-      simpa only [p2, lkm.totalSize_append] using hpc2
-    have hs2gp : s2.getReg AbiReg.gp = regionBase := (hoth2 _ (by decide)).trans hs1gp
-    have hlRest : lkm.linkSpec (p2 ++ drvRomStoresGo checkerTabMini.romBase (idx + 1) rest ++ post) =
-        .ok (env.code, env.labels) := by
-      simpa only [p2, List.append_assoc] using hlSt
-    obtain ⟨kR, s3, hrunR, hpcR, hothR, houtR, hbytesR⟩ :=
-      ih (idx + 1) (by simp only [List.length_cons] at hbound; omega) p2 hlRest s2 hpc2' hs2gp
-    have haddrEq : regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 8 * idx) =
-        s1.getReg AbiReg.gp + BitVec.ofInt 64 (checkerTabMini.romBase + 8 * (idx : Int)) := by
-      rw [hs1gp, hOffEq]
-    have h1out : MemEqOutside ⟨regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 8 * idx),
-        8 * (w :: rest).length⟩ st.mem s2.mem := by
-      rw [hm2, ← haddrEq, hm1]
-      apply MemEqOutside.writeWord64
-      intro k hk
-      refine ⟨k, ?_, rfl⟩
-      dsimp only [MemSpan.contains] at hk ⊢; rw [List.length_cons]; omega
-    have hRout : MemEqOutside ⟨regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 8 * idx),
-        8 * (w :: rest).length⟩ s2.mem s3.mem := by
-      apply MemEqOutside.mono _ houtR
-      intro a ⟨k, hk, ha⟩
-      dsimp only [MemSpan.contains] at hk
-      simp only [List.length_cons] at hbound
-      have hNeedEq : abiNeed checkerTabMini = 205 * abiSlot := checkerTabMini_abiNeed_eq
-      have h211 : abiSlot ≤ abiNeed checkerTabMini := by rw [hNeedEq]; simp [abiSlot]
-      refine ⟨8 + k, ?_, ?_⟩
-      · dsimp only [MemSpan.contains]; rw [List.length_cons]; omega
-      · rw [ha, BitVec.add_assoc, BitVec.add_assoc]
-        congr 1; apply BitVec.eq_of_toNat_eq
-        rw [BitVec.toNat_add, BitVec.toNat_add, BitVec.toNat_ofNat, BitVec.toNat_ofNat, BitVec.toNat_ofNat, BitVec.toNat_ofNat]
-        have h164 : checkerTabMini.romBase.toNat + 8 * idx < 2 ^ 64 := by omega
-        have h264 : checkerTabMini.romBase.toNat + 8 * (idx + 1) < 2 ^ 64 := by omega
-        have hk64 : k < 2 ^ 64 := by omega
-        have hsk64 : 8 + k < 2 ^ 64 := by omega
-        rw [Nat.mod_eq_of_lt h164, Nat.mod_eq_of_lt h264, Nat.mod_eq_of_lt hk64, Nat.mod_eq_of_lt hsk64]
-        omega
-    refine ⟨_, s3, by rw [run_add, run_add, hrun1]; dsimp only; rw [hrun2]; exact hrunR, ?_, ?_, h1out.trans hRout, ?_⟩
-    · rw [hpcR]; congr 1; congr 1
-      simp only [p2, p1, cLi, cSt, drvRomStoresGo, lkm.totalSize_append, Nat.add_assoc]
-    · intro q hq0 hq1; exact (hothR q hq0 hq1).trans ((hoth2 q hq0).trans (hoth1 q hq1))
-    · intro j hj b hb
-      cases j with
+      rw [hpc1]; simp only [p1, cChunk, lkm.totalSize_append]
+    have hs1gp : s1.getReg AbiReg.gp = regionBase := (hoth1 _ (by decide) (by decide)).trans hgp
+    have hlR : lkm.linkSpec (p1 ++ cRest ++ post) = .ok (env.code, env.labels) := by
+      simpa only [p1, List.append_assoc] using hl1
+    obtain ⟨k2, s2, hrun2, hpc2, hoth2, hout2, hbytes2, hne2⟩ :=
+      ih (ci + 1) hrestLe hrestBnd p1 hlR s1 hpc1' hs1gp
+    refine ⟨k1 + k2, s2, by rw [run_add, hrun1]; exact hrun2, ?_,
+      fun q hq0 hq1 => (hoth2 q hq0 hq1).trans (hoth1 q hq0 hq1), hout1.trans hout2, ?_, ?_⟩
+    · rw [hpc2]
+      simp only [p1, cChunk, List.zipIdx_cons, List.flatMap_cons, lkm.totalSize_append, Nat.add_assoc]
+    · intro k hk j hj b hb
+      cases k with
       | zero =>
-        simp only [List.getElem_cons_zero, Nat.add_zero]
-        have hnotIn : ¬(MemSpan.mk (regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 8 * (idx + 1)))
-            (8 * rest.length)).contains
-            (regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 8 * idx) + BitVec.ofNat 64 b) := by
-          intro ⟨m', hm', heq⟩
-          dsimp only [MemSpan.contains] at hm'
-          have hNeedEq : abiNeed checkerTabMini = 205 * abiSlot := checkerTabMini_abiNeed_eq
-          have h211 : abiSlot ≤ abiNeed checkerTabMini := by rw [hNeedEq]; simp [abiSlot]
-          simp only [List.length_cons] at hbound
-          have hadd1 : regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 8 * idx) + BitVec.ofNat 64 b =
-              regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 8 * idx + b) := by
-            rw [BitVec.add_assoc]; congr 1; apply BitVec.eq_of_toNat_eq
-            rw [BitVec.toNat_add, BitVec.toNat_ofNat, BitVec.toNat_ofNat, BitVec.toNat_ofNat]
-            have ha : checkerTabMini.romBase.toNat + 8 * idx < 2 ^ 64 := by omega
-            have hlt : checkerTabMini.romBase.toNat + 8 * idx + b < 2 ^ 64 := by omega
-            rw [Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt (by omega : b < 2 ^ 64), Nat.mod_eq_of_lt hlt]
-          have hadd2 : regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 8 * (idx + 1)) + BitVec.ofNat 64 m' =
-              regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 8 * (idx + 1) + m') := by
-            rw [BitVec.add_assoc]; congr 1; apply BitVec.eq_of_toNat_eq
-            rw [BitVec.toNat_add, BitVec.toNat_ofNat, BitVec.toNat_ofNat, BitVec.toNat_ofNat]
-            have ha : checkerTabMini.romBase.toNat + 8 * (idx + 1) < 2 ^ 64 := by omega
-            have hm64 : m' < 2 ^ 64 := by omega
-            have hlt : checkerTabMini.romBase.toNat + 8 * (idx + 1) + m' < 2 ^ 64 := by omega
-            rw [Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hm64, Nat.mod_eq_of_lt hlt]
-          rw [hadd1, hadd2] at heq
-          have hcon := congrArg BitVec.toNat heq
-          rw [BitVec.toNat_add, BitVec.toNat_add, BitVec.toNat_ofNat, BitVec.toNat_ofNat] at hcon
-          have ha1 : checkerTabMini.romBase.toNat + 8 * idx + b < 2 ^ 64 := by omega
-          have ha2 : checkerTabMini.romBase.toNat + 8 * (idx + 1) + m' < 2 ^ 64 := by omega
-          have hrb1 : regionBase.toNat + (checkerTabMini.romBase.toNat + 8 * idx + b) < 2 ^ 64 := by omega
-          have hrb2 : regionBase.toNat + (checkerTabMini.romBase.toNat + 8 * (idx + 1) + m') < 2 ^ 64 := by omega
-          rw [Nat.mod_eq_of_lt ha1, Nat.mod_eq_of_lt ha2, Nat.mod_eq_of_lt hrb1, Nat.mod_eq_of_lt hrb2] at hcon
+        simp only [Nat.add_zero, List.getElem_cons_zero]
+        have hnotR : ∀ (k' : Nat) (hk' : k' < rest.length) (j' : Nat), j' < rest[k'].length → ∀ b', b' < 4 →
+            regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ci + 4 * j) + BitVec.ofNat 64 b ≠
+              regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * ((ci + 1) + k') + 4 * j') +
+                BitVec.ofNat 64 b' := by
+          intro k' hk' j' hj' b' hb' heq
+          have hb1 := hwsBnd j hj
+          have hb2 := hrestBnd k' hk' j' hj'
+          have hidx := rom_byte_addr_inj hb hb'
+            (by omega : regionBase.toNat + (checkerTabMini.romBase.toNat + 4 * (1024 * ci + j)) + 4 ≤ 2 ^ 64)
+            (by omega : regionBase.toNat + (checkerTabMini.romBase.toNat + 4 * (1024 * ((ci + 1) + k') + j')) + 4 ≤ 2 ^ 64)
+            (by simpa only [show checkerTabMini.romBase.toNat + 4096 * ci + 4 * j =
+                checkerTabMini.romBase.toNat + 4 * (1024 * ci + j) by omega,
+              show checkerTabMini.romBase.toNat + 4096 * ((ci + 1) + k') + 4 * j' =
+                checkerTabMini.romBase.toNat + 4 * (1024 * ((ci + 1) + k') + j') by omega] using heq)
+          have hj1024 : j < 1024 := Nat.lt_of_lt_of_le hj hwsLe
           omega
-        rw [houtR _ hnotIn, hm2, ← haddrEq, writeWord64_apply_lt_cd _ _ _ b hb, ht1_1]
-      | succ j' =>
-        simp only [List.getElem_cons_succ, show idx + (j' + 1) = (idx + 1) + j' from by omega]
-        exact hbytesR j' (by simp only [List.length_cons] at hj; omega) b hb
+        rw [hne2 _ hnotR, hbytes1 j hj b hb]
+      | succ k' =>
+        simp only [List.getElem_cons_succ, show ci + (k' + 1) = (ci + 1) + k' by omega]
+        exact hbytes2 k' (by simp at hk; omega) j hj b hb
+    · intro a hne
+      rw [hne2 a (fun k' hk' j hj b hb => by
+        simpa only [show ci + (k' + 1) = (ci + 1) + k' by omega] using
+          hne (k' + 1) (by simp; omega) j hj b hb),
+        hne1 a (fun j hj b hb => by
+          simpa only [Nat.add_zero] using hne 0 (by simp) j hj b hb)]
 
 theorem drvRomStores_sim_gen {lkm : LinkModel} (env : CodeEnvGen lkm)
     (regionBase : BitVec 64)
     (hRegAlign : isAligned regionBase 8 = true)
     (hReg64 : regionBase.toNat + abiNeed checkerTabMini < 2 ^ 64)
     (pre post : List AsmItem)
-    (hlink : lkm.linkSpec (pre ++ drvRomStoresGo checkerTabMini.romBase 0 (romWords64 checkerTabMini.rom) ++ post) =
+    (hlink : lkm.linkSpec (pre ++ drvRomStoresAsm checkerTabMini.romBase checkerTabMini.rom ++ post) =
       .ok (env.code, env.labels))
     (st : RV64.State) (hpc : st.pc = BitVec.ofNat 64 (4 * lkm.totalSize pre))
     (hgp : st.getReg AbiReg.gp = regionBase) :
     ∃ k st',
       RV64.run env.rom k st = .cont st' ∧
       st'.pc = BitVec.ofNat 64 (4 * (lkm.totalSize pre +
-        lkm.totalSize (drvRomStoresGo checkerTabMini.romBase 0 (romWords64 checkerTabMini.rom)))) ∧
+        lkm.totalSize (drvRomStoresAsm checkerTabMini.romBase checkerTabMini.rom))) ∧
       (∀ q, q ≠ AbiReg.t0 → q ≠ AbiReg.t1 → st'.getReg q = st.getReg q) ∧
       MemEqOutside ⟨regionBase + BitVec.ofNat 64 checkerTabMini.romBase.toNat, 8 * checkerTabMini.romWords⟩
         st.mem st'.mem ∧
@@ -1581,41 +2051,53 @@ theorem drvRomStores_sim_gen {lkm : LinkModel} (env : CodeEnvGen lkm)
     have hrb : checkerTabMini.romBase = ((16 + 24 * (checkerTabMini.nb + checkerTabMini.nw) : Nat) : Int) := by
       simp [Tab.romBase]
     rw [hrb, Int.toNat_natCast, t_nb, t_nw]; simp [abiSlot]; omega
-  have hwsLen : (romWords64 checkerTabMini.rom).length = checkerTabMini.romWords := by
-    rw [romWords64_length]; rfl
-  obtain ⟨k, st', hrun, hpc', hoth, hout, hbytes⟩ :=
-    drvRomStoresGo_sim_gen env regionBase hRegAlign hReg64 0 (romWords64 checkerTabMini.rom)
-      (by rw [Nat.zero_add, hwsLen]; exact hromBounds) pre post hlink st hpc hgp
-  rw [Nat.mul_zero, Nat.add_zero, hwsLen] at hout
+  let ws32 := romWords32 checkerTabMini.rom
+  let chunks := romChunks1024 ws32
+  have hbound : ∀ (k : Nat) (hk : k < chunks.length) (j : Nat), j < chunks[k].length →
+      4 * (1024 * (0 + k) + j) + 4 ≤ 8 * checkerTabMini.romWords := by
+    intro k hk j hj
+    obtain ⟨hlt, _⟩ := romChunks1024_chunk_getElem ws32 k j hk hj
+    dsimp only [ws32] at hlt
+    rw [romWords32_length] at hlt
+    dsimp only [Tab.romWords]
+    omega
+  obtain ⟨k, st', hrun, hpc', hoth, hout, hbytes, _⟩ :=
+    drvRomChunks_sim_gen env regionBase hRegAlign hReg64 hromBounds 0 chunks
+      (romChunks1024_chunk_le ws32) hbound pre post
+      (by simpa only [drvRomStoresAsm, chunks, ws32] using hlink) st hpc hgp
   refine ⟨k, st', hrun, hpc', hoth, hout, ?_⟩
   intro m hm
-  obtain ⟨hdiv, hex⟩ := romWords64_getElem checkerTabMini.rom m hm
+  obtain ⟨hm4, hex⟩ := romWords32_getElem checkerTabMini.rom m hm
+  obtain ⟨hc, hj, hchunk⟩ := romChunks1024_getElem ws32 (m / 4) hm4
   have hNeedEq : abiNeed checkerTabMini = 205 * abiSlot := checkerTabMini_abiNeed_eq
   have h211 : abiSlot ≤ abiNeed checkerTabMini := by rw [hNeedEq]; simp [abiSlot]
+  have hb4 := hbound ((m / 4) / 1024) hc ((m / 4) % 1024) hj
   have hadd : regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + m) =
-      regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 8 * (0 + m / 8)) + BitVec.ofNat 64 (m % 8) := by
+      regionBase + BitVec.ofNat 64 (checkerTabMini.romBase.toNat + 4096 * (0 + (m / 4) / 1024) +
+        4 * ((m / 4) % 1024)) + BitVec.ofNat 64 (m % 4) := by
     rw [BitVec.add_assoc]; congr 1
     apply BitVec.eq_of_toNat_eq
     rw [BitVec.toNat_add, BitVec.toNat_ofNat, BitVec.toNat_ofNat, BitVec.toNat_ofNat]
-    have hm8 : m / 8 < checkerTabMini.romWords := by rw [← hwsLen]; exact hdiv
-    have hlt1 : checkerTabMini.romBase.toNat + 8 * (0 + m / 8) < 2 ^ 64 := by omega
+    have hlt1 : checkerTabMini.romBase.toNat + 4096 * (0 + (m / 4) / 1024) + 4 * ((m / 4) % 1024) < 2 ^ 64 := by omega
     have hlt2 : checkerTabMini.romBase.toNat + m < 2 ^ 64 := by omega
-    rw [Nat.mod_eq_of_lt hlt1, Nat.mod_eq_of_lt hlt2, Nat.mod_eq_of_lt (by omega : m % 8 < 2 ^ 64)]
+    rw [Nat.mod_eq_of_lt hlt1, Nat.mod_eq_of_lt hlt2, Nat.mod_eq_of_lt (by omega : m % 4 < 2 ^ 64)]
     omega
-  rw [hadd, hbytes (m / 8) hdiv (m % 8) (Nat.mod_lt _ (by decide)), hex]
+  rw [hadd, hbytes ((m / 4) / 1024) hc ((m / 4) % 1024) hj (m % 4) (Nat.mod_lt _ (by decide))]
+  dsimp only [chunks, ws32] at hchunk ⊢
+  rw [hchunk, hex]
 
 theorem drvRomStores_sim (regionBase : BitVec 64)
     (hRegAlign : isAligned regionBase 8 = true)
     (hReg64 : regionBase.toNat + abiNeed checkerTabMini < 2 ^ 64)
     (pre post : List AsmItem)
-    (hlink : checkerLM.linkSpec (pre ++ drvRomStoresGo checkerTabMini.romBase 0 (romWords64 checkerTabMini.rom) ++ post) =
+    (hlink : checkerLM.linkSpec (pre ++ drvRomStoresAsm checkerTabMini.romBase checkerTabMini.rom ++ post) =
       .ok (checkerEnv.code, checkerEnv.labels))
     (st : RV64.State) (hpc : st.pc = BitVec.ofNat 64 (4 * checkerLM.totalSize pre))
     (hgp : st.getReg AbiReg.gp = regionBase) :
     ∃ k st',
       RV64.run checkerEnv.rom k st = .cont st' ∧
       st'.pc = BitVec.ofNat 64 (4 * (checkerLM.totalSize pre +
-        checkerLM.totalSize (drvRomStoresGo checkerTabMini.romBase 0 (romWords64 checkerTabMini.rom)))) ∧
+        checkerLM.totalSize (drvRomStoresAsm checkerTabMini.romBase checkerTabMini.rom))) ∧
       (∀ q, q ≠ AbiReg.t0 → q ≠ AbiReg.t1 → st'.getReg q = st.getReg q) ∧
       MemEqOutside ⟨regionBase + BitVec.ofNat 64 checkerTabMini.romBase.toNat, 8 * checkerTabMini.romWords⟩
         st.mem st'.mem ∧
@@ -1686,7 +2168,7 @@ theorem drvInitSub_sim_gen {lkm : LinkModel} (env : CodeEnvGen lkm)
     0#64 checkerTabMini.nb
   let cL32wloop := drvFillConstLoop "ca_drv_l32wloop" "ca_drv_l32wdone" (checkerTabMini.dlen32 checkerTabMini.nb)
     (BitVec.ofNat 64 (2 * abiWords)) checkerTabMini.nw
-  let cRom := drvRomStoresGo checkerTabMini.romBase 0 (romWords64 checkerTabMini.rom)
+  let cRom := drvRomStoresAsm checkerTabMini.romBase checkerTabMini.rom
   let cZero := drvFillConstLoop "ca_drv_zloop" "ca_drv_zdone" checkerTabMini.resBase
     0#64 (checkerTabMini.nxres + checkerTabMini.ng)
   let p0 := pre ++ [Asm.lbl drvInitLabel]
@@ -1871,7 +2353,7 @@ theorem drvInitSub_sim_gen {lkm : LinkModel} (env : CodeEnvGen lkm)
     simpa only [p4, cL32wloop, lkm.totalSize_append] using hpc4b
   have hs4gp : s4.getReg AbiReg.gp = regionBase :=
     (hoth4b _ (by decide) (by decide) (by decide) (by decide) (by decide) (by decide)).trans hs4agp
-  -- 9. drvRomStoresGo
+  -- 9. drvRomStoresAsm
   have hl5 : lkm.linkSpec (p4 ++ cRom ++ (cZero ++ ([Asm.ret] ++ post))) =
       .ok (env.code, env.labels) := by
     simpa only [p4, List.append_assoc] using hl4b

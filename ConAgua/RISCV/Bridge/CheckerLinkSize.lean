@@ -3278,35 +3278,120 @@ private theorem resetStack_farTotalWords_le :
   have hb : farTotalWords [Asm.add AbiReg.t1 AbiReg.gp AbiReg.t1, Asm.sd AbiReg.gp AbiReg.t1 8#12] = 2 := rfl
   omega
 
+private theorem romWords32_length_le (xs : List UInt8) :
+    (romWords32 xs).length ≤ (xs.length + 3) / 4 := by
+  match xs with
+  | [] => simp [romWords32]
+  | [_] => simp [romWords32]
+  | [_, _] => simp [romWords32]
+  | [_, _, _] => simp [romWords32]
+  | _ :: _ :: _ :: _ :: rest =>
+    have ih := romWords32_length_le rest
+    simp only [romWords32, List.length_cons]
+    omega
+
+private theorem sw_map_farTotalWords (r : Reg) (slots : List Nat) :
+    farTotalWords (slots.map fun (s : Nat) =>
+      Asm.sw AbiReg.t0 r (BitVec.ofInt 12 (4 * Int.ofNat s - 2048))) = slots.length := by
+  induction slots with
+  | nil => rfl
+  | cons s _ ih =>
+    simp only [List.map_cons, farTotalWords_cons, ih, List.length_cons]
+    have h1 : farWordSize (Asm.sw AbiReg.t0 r (BitVec.ofInt 12 (4 * Int.ofNat s - 2048))) = 1 := rfl
+    omega
+
+private theorem drvRomGroupAsm_farTotalWords_eq (v : BitVec 32) (slots : List Nat) :
+    farTotalWords (drvRomGroupAsm (v, slots)) =
+      (if v == 0#32 then 0 else (li32Instrs AbiReg.t1 v).length) + slots.length := by
+  dsimp only [drvRomGroupAsm]
+  split
+  · rw [sw_map_farTotalWords, Nat.zero_add]
+  · rw [farTotalWords_append, farTotalWords_of_allInstrs (allInstrs_map_instr _),
+      List.length_map, sw_map_farTotalWords]
+
+private theorem romInsertGroup_farTotalWords_le (slot : Nat) (v : BitVec 32)
+    (gs : List (BitVec 32 × List Nat)) :
+    farTotalWords ((romInsertGroup slot v gs).flatMap drvRomGroupAsm) ≤
+      5 + farTotalWords (gs.flatMap drvRomGroupAsm) := by
+  induction gs with
+  | nil =>
+    simp only [romInsertGroup, List.flatMap_cons, List.flatMap_nil, List.append_nil,
+      farTotalWords_nil, drvRomGroupAsm_farTotalWords_eq, List.length_singleton]
+    have := li32Instrs_length_le AbiReg.t1 v
+    split <;> omega
+  | cons g rest ih =>
+    rcases g with ⟨k, ss⟩
+    dsimp only [romInsertGroup]
+    split
+    · simp only [List.flatMap_cons, farTotalWords_append, drvRomGroupAsm_farTotalWords_eq,
+        List.length_cons]
+      omega
+    · simp only [List.flatMap_cons, farTotalWords_append]
+      omega
+
+private theorem romGroupChunkGo_farTotalWords_le (slot : Nat) (ws : List (BitVec 32)) :
+    farTotalWords ((romGroupChunkGo slot ws).flatMap drvRomGroupAsm) ≤ 5 * ws.length := by
+  induction ws generalizing slot with
+  | nil => simp [romGroupChunkGo, farTotalWords]
+  | cons w ws ih =>
+    simp only [romGroupChunkGo, List.length_cons]
+    have h1 := romInsertGroup_farTotalWords_le slot w (romGroupChunkGo (slot + 1) ws)
+    have h2 := ih (slot + 1)
+    omega
+
+private theorem drvRomChunkAsm_farTotalWords_le (romBase : Int) (ci : Nat) (ws : List (BitVec 32)) :
+    farTotalWords (drvRomChunkAsm romBase ci ws) ≤ 11 + 5 * ws.length := by
+  dsimp only [drvRomChunkAsm]
+  rw [farTotalWords_append]
+  have h1 := addImmOff_farTotalWords_le AbiReg.t0 AbiReg.gp AbiReg.t1
+    (romBase + 4096 * Int.ofNat ci + 2048)
+  have h2 := romGroupChunkGo_farTotalWords_le 0 ws
+  change _ + farTotalWords ((romGroupChunkGo 0 ws).flatMap drvRomGroupAsm) ≤ _
+  omega
+
+private theorem romChunks1024_farTotalWords_le (romBase : Int) :
+    ∀ (k : Nat) (ci : Nat) (ws : List (BitVec 32)),
+      ws.length ≤ 1024 * k →
+      farTotalWords (((romChunks1024 ws).zipIdx ci).flatMap fun (c, idx) =>
+        drvRomChunkAsm romBase idx c) ≤ 11 * k + 5 * ws.length := by
+  intro k
+  induction k with
+  | zero =>
+    intro ci ws hlen
+    cases ws with
+    | nil => simp [romChunks1024, farTotalWords]
+    | cons _ _ => simp at hlen
+  | succ k ih =>
+    intro ci ws hlen
+    cases ws with
+    | nil => simp [romChunks1024, farTotalWords]
+    | cons w rest =>
+      let ys := w :: rest
+      have hdropLen : (ys.drop 1024).length ≤ 1024 * k := by
+        simp only [List.length_drop, ys, List.length_cons] at hlen ⊢
+        omega
+      have hsplitLen : (ys.take 1024).length + (ys.drop 1024).length = ys.length := by
+        simp only [List.length_take, List.length_drop]
+        omega
+      have hchunk : romChunks1024 (w :: rest) =
+          ys.take 1024 :: romChunks1024 (ys.drop 1024) := by
+        conv => lhs; rw [romChunks1024]
+      rw [hchunk]
+      simp only [List.zipIdx_cons, List.flatMap_cons, farTotalWords_append]
+      have hhead := drvRomChunkAsm_farTotalWords_le romBase ci (ys.take 1024)
+      have htail := ih (ci + 1) (ys.drop 1024) hdropLen
+      dsimp only at htail
+      have hyLen : ys.length = (w :: rest).length := rfl
+      omega
+
 theorem drvInitSubAsm_farTotalWords_le {tab : Tab} (ht : TabSmall32 tab) :
     farTotalWords (drvInitSubAsm tab) ≤ 81000 := by
   have hnb := ht.nb_le
   have hnw := ht.nw_le
   have hrom := ht.rom_le
   have hnbuf : tab.nbuf ≤ 2 := Nat.min_le_right _ _
-  have hromBase : 0 ≤ tab.romBase ∧ tab.romBase ≤ 7000 := by dsimp [Tab.romBase]; omega
-  have hromLen8 : (romWords64 tab.rom).length ≤ 5001 := by
-    have go : ∀ (n : Nat) (xs : List UInt8), xs.length ≤ 8 * n → (romWords64 xs).length ≤ n := by
-      intro n
-      induction n with
-      | zero =>
-        intro xs h; cases xs with | nil => simp [romWords64] | cons _ _ => simp at h
-      | succ n ih =>
-        intro xs h
-        cases xs with
-        | nil => simp [romWords64]
-        | cons b bs' =>
-          unfold romWords64
-          split
-          · next _ _ _ _ _ _ _ _ rest heq =>
-            have hl : (b :: bs').length = (rest.length + 8) := by
-              have := congrArg List.length heq
-              simpa [List.length_cons] using this
-            simp only [List.length_cons]
-            exact Nat.succ_le_succ (ih rest (by omega))
-          · simp
-          · simp
-    exact go 5001 tab.rom (by omega)
+  have hromLen4 : (romWords32 tab.rom).length ≤ 10000 :=
+    Nat.le_trans (romWords32_length_le tab.rom) (by omega)
   have hsumConst : ∀ {α : Type} (xs : List α) (c acc : Nat),
       xs.foldl (fun a _ => a + c) acc = acc + c * xs.length := by
     intro α xs c
@@ -3325,25 +3410,10 @@ theorem drvInitSubAsm_farTotalWords_le {tab : Tab} (ht : TabSmall32 tab) :
     refine Nat.le_trans (farTotalWords_flatMap_le _ _ (fun _ => 12)
       (fun p _ => storeMemOff_farTotalWords_le ..)) ?_
     rw [hsumConst, Nat.zero_add, List.length_range]; exact Nat.le_refl _
-  have hromS : farTotalWords (List.flatMap (fun x =>
-      li AbiReg.t1 x.1 ++ storeMemOff .sd AbiReg.gp AbiReg.t1 AbiReg.t0 (tab.romBase + 8 * (x.2 : Int)))
-      (romWords64 tab.rom).zipIdx) ≤ 16 * (romWords64 tab.rom).length := by
-    refine Nat.le_trans (farTotalWords_flatMap_le _ _ (fun _ => 16) (fun ⟨w, i⟩ hm => ?_)) ?_
-    · have hi_lt : i < (romWords64 tab.rom).length := by
-        have hle : ∀ (xs : List (BitVec 64)) (k : Nat) (a : BitVec 64) (b : Nat),
-            (a, b) ∈ xs.zipIdx k → b < k + xs.length := by
-          intro xs; induction xs with | nil => simp | cons x xs ih =>
-            intro k a b hm; simp only [List.zipIdx_cons, List.mem_cons, Prod.mk.injEq] at hm
-            rcases hm with ⟨rfl, rfl⟩ | hm'
-            · simp
-            · have := ih (k + 1) _ _ hm'; simp; omega
-        simpa using hle _ 0 w i hm
-      simp only [farTotalWords_append]
-      have h1 := li_farTotalWords_le AbiReg.t1 w
-      have h2 := storeMemOff_farTotalWords_le_32 .sd AbiReg.gp AbiReg.t1 AbiReg.t0
-        (tab.romBase + 8 * (i : Int)) (by omega) (by omega)
-      omega
-    · rw [hsumConst, Nat.zero_add, List.length_zipIdx]; exact Nat.le_refl _
+  have hromS : farTotalWords (drvRomStoresAsm tab.romBase tab.rom) ≤ 50110 := by
+    have hle := romChunks1024_farTotalWords_le tab.romBase 10 0 (romWords32 tab.rom) (by omega)
+    change farTotalWords (drvRomStoresAsm tab.romBase tab.rom) ≤ _ at hle
+    omega
   have hreset := resetStack_farTotalWords_le
   dsimp only [drvInitSubAsm]
   simp only [farTotalWords_append] at hreset ⊢

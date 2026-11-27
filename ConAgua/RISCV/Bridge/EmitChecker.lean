@@ -70,11 +70,78 @@ def drvFillStrideLoop (loopLbl doneLbl : String) (off : Int) (initOff stride : B
      Asm.j loopLbl,
      Asm.lbl doneLbl]
 
+/-- Pack up to 4 little-endian bytes (zero-padded) into a 32-bit word. -/
+def romWord32 (b0 b1 b2 b3 : UInt8) : BitVec 32 :=
+  b0.toBitVec.zeroExtend 32 |||
+  (b1.toBitVec.zeroExtend 32 <<< 8) |||
+  (b2.toBitVec.zeroExtend 32 <<< 16) |||
+  (b3.toBitVec.zeroExtend 32 <<< 24)
+
+/-- Partition a byte list into zero-padded little-endian 32-bit words. -/
+def romWords32 : List UInt8 → List (BitVec 32)
+  | [] => []
+  | [b0] => [romWord32 b0 0 0 0]
+  | [b0, b1] => [romWord32 b0 b1 0 0]
+  | [b0, b1, b2] => [romWord32 b0 b1 b2 0]
+  | b0 :: b1 :: b2 :: b3 :: rest => romWord32 b0 b1 b2 b3 :: romWords32 rest
+
+/-- Partition a list into chunks of at most 1,024 elements (4 KB of 32-bit words). -/
+def romChunks1024 {α : Type} : List α → List (List α)
+  | [] => []
+  | x :: xs =>
+    let ys := x :: xs
+    ys.take 1024 :: romChunks1024 (ys.drop 1024)
+termination_by xs => xs.length
+decreasing_by simp [List.length_drop]; omega
+
+/-- Insert `(slot, v)` into an association list mapping 32-bit values to slot indices. -/
+def romInsertGroup (slot : Nat) (v : BitVec 32) :
+    List (BitVec 32 × List Nat) → List (BitVec 32 × List Nat)
+  | [] => [(v, [slot])]
+  | (k, ss) :: rest =>
+    if k == v then (k, slot :: ss) :: rest
+    else (k, ss) :: romInsertGroup slot v rest
+
+/-- Group a chunk's 32-bit words by value, tracking each word's slot index (`0 .. ws.length - 1`). -/
+def romGroupChunkGo (slot : Nat) : List (BitVec 32) → List (BitVec 32 × List Nat)
+  | [] => []
+  | w :: rest => romInsertGroup slot w (romGroupChunkGo (slot + 1) rest)
+
+def romGroupChunk (ws : List (BitVec 32)) : List (BitVec 32 × List Nat) :=
+  romGroupChunkGo 0 ws
+
+/-- Emit instructions for one value group `(v, slots)` relative to base register `t0`
+    (which holds `gp + romBase + 4096 * chunkIdx + 2048`).
+    Zero words emit explicit `sw zero, off(t0)`; non-zero words materialize `v` once into `t1`
+    via `li32Instrs` (`addi`, `lui`, or `lui + addi`) and emit `sw t1, off(t0)` for every slot. -/
+def drvRomGroupAsm (g : BitVec 32 × List Nat) : List AsmItem :=
+  let (v, slots) := g
+  if v == 0#32 then
+    slots.map fun (s : Nat) =>
+      Asm.sw AbiReg.t0 AbiReg.zero (BitVec.ofInt 12 (4 * Int.ofNat s - 2048))
+  else
+    (li32Instrs AbiReg.t1 v).map .instr ++
+    slots.map fun (s : Nat) =>
+      Asm.sw AbiReg.t0 AbiReg.t1 (BitVec.ofInt 12 (4 * Int.ofNat s - 2048))
+
+/-- Emit instructions for one 4 KB chunk (`≤ 1024` 32-bit words) at `romBase + 4096 * chunkIdx`.
+    Sets `t0 := gp + romBase + 4096 * chunkIdx + 2048` once via `addImmOff` (scratch `t1`),
+    then emits each value group. Clobbers only `t0` and `t1`. -/
+def drvRomChunkAsm (romBase : Int) (chunkIdx : Nat) (ws : List (BitVec 32)) : List AsmItem :=
+  addImmOff AbiReg.t0 AbiReg.gp AbiReg.t1 (romBase + 4096 * Int.ofNat chunkIdx + 2048) ++
+  (romGroupChunk ws).flatMap drvRomGroupAsm
+
+/-- Emit chunked, value-grouped 32-bit `sw` instructions initializing `bs` at `gp + romBase`.
+    Clobbers only `t0` and `t1`; Harvard instruction-only (no `LD` from ROM). -/
+def drvRomStoresAsm (romBase : Int) (bs : List UInt8) : List AsmItem :=
+  ((romChunks1024 (romWords32 bs)).zipIdx).flatMap fun (ws, ci) =>
+    drvRomChunkAsm romBase ci ws
+
 /-- Shared leaf initialization subroutine `ca_drv_init`, called by both `ca_start` and
     `ca_start_c` after saving caller registers and setting `gp := a4`.
     Uses re-rolled RV64 loops for descriptor bases, lengths, len32s, and result/global zeroing;
-    keeps `romStores` instruction-based (`li` + `sd`) because `RV64.Rom` is Harvard
-    instruction-fetch-only memory (no `LD` from ROM). -/
+    uses chunked, value-grouped 32-bit `sw` stores (`drvRomStoresAsm`) because `RV64.Rom` is
+    Harvard instruction-fetch-only memory (no `LD` from ROM). -/
 def drvInitSubAsm (tab : Tab := checkerTabMini) : List AsmItem :=
   let resetStack : List AsmItem :=
     li AbiReg.t1 (BitVec.ofNat 64 (abiSlot + abiStack)) ++
@@ -102,9 +169,7 @@ def drvInitSubAsm (tab : Tab := checkerTabMini) : List AsmItem :=
       0#64 tab.nb ++
     drvFillConstLoop "ca_drv_l32wloop" "ca_drv_l32wdone" (tab.dlen32 tab.nb)
       (BitVec.ofNat 64 (2 * abiWords)) tab.nw
-  let romStores : List AsmItem := (romWords64 tab.rom).zipIdx.flatMap fun (w, i) =>
-    li AbiReg.t1 w ++
-    storeMemOff .sd AbiReg.gp AbiReg.t1 AbiReg.t0 (tab.romBase + 8 * (i : Int))
+  let romStores : List AsmItem := drvRomStoresAsm tab.romBase tab.rom
   let zeroResGlobs : List AsmItem :=
     drvFillConstLoop "ca_drv_zloop" "ca_drv_zdone" tab.resBase 0#64 (tab.nxres + tab.ng)
   [Asm.lbl drvInitLabel] ++

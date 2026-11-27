@@ -103,27 +103,6 @@ def drvBufLenStores (tab : Tab) : List AsmItem :=
     let srcReg := if p == 0 then AbiReg.a1 else AbiReg.a3
     storeMemOff .sd AbiReg.gp srcReg AbiReg.t0 (tab.dlen p)
 
-def drvRomStoresGo (romBase : Int) (idx : Nat) : List (BitVec 64) → List AsmItem
-  | [] => []
-  | w :: ws =>
-    (li AbiReg.t1 w ++ storeMemOff .sd AbiReg.gp AbiReg.t1 AbiReg.t0 (romBase + 8 * (idx : Int))) ++
-      drvRomStoresGo romBase (idx + 1) ws
-
-theorem drvRomStores_eq (romBase : Int) (ws : List (BitVec 64)) :
-    (ws.zipIdx.flatMap fun (w, i) =>
-      li AbiReg.t1 w ++ storeMemOff .sd AbiReg.gp AbiReg.t1 AbiReg.t0 (romBase + 8 * (i : Int))) =
-      drvRomStoresGo romBase 0 ws := by
-  have hgen : ∀ (k : Nat) (xs : List (BitVec 64)),
-      ((xs.zipIdx k).flatMap fun (w, i) =>
-        li AbiReg.t1 w ++ storeMemOff .sd AbiReg.gp AbiReg.t1 AbiReg.t0 (romBase + 8 * (i : Int))) =
-        drvRomStoresGo romBase k xs := by
-    intro k xs
-    induction xs generalizing k with
-    | nil => simp [List.zipIdx, drvRomStoresGo]
-    | cons x xs ih =>
-      simp only [List.zipIdx_cons, List.flatMap_cons, drvRomStoresGo, ih (k + 1)]
-  exact hgen 0 ws
-
 def drvInitBody (tab : Tab) : List AsmItem :=
   drvResetStack ++
   drvBufBaseStores tab ++
@@ -138,14 +117,12 @@ def drvInitBody (tab : Tab) : List AsmItem :=
     0#64 tab.nb ++
   drvFillConstLoop "ca_drv_l32wloop" "ca_drv_l32wdone" (tab.dlen32 tab.nb)
     (BitVec.ofNat 64 (2 * abiWords)) tab.nw ++
-  drvRomStoresGo tab.romBase 0 (romWords64 tab.rom) ++
+  drvRomStoresAsm tab.romBase tab.rom ++
   drvFillConstLoop "ca_drv_zloop" "ca_drv_zdone" tab.resBase 0#64 (tab.nxres + tab.ng)
 
 theorem drvInitSubAsm_decomp (tab : Tab) :
     drvInitSubAsm tab = [Asm.lbl drvInitLabel] ++ drvInitBody tab ++ [Asm.ret] := by
   dsimp only [drvInitSubAsm, drvInitBody, drvResetStack, drvBufBaseStores, drvBufLenStores]
-  change _ = _
-  rw [drvRomStores_eq]
   simp only [List.append_assoc]
 
 def drvPhaseASetup (tab : Tab) : List AsmItem :=
@@ -641,43 +618,423 @@ theorem romWords64_length (bs : List UInt8) :
   | [_] | [_, _] | [_, _, _] | [_, _, _, _] | [_, _, _, _, _] | [_, _, _, _, _, _] | [_, _, _, _, _, _, _] =>
     simp [romWords64]
 
-private theorem storeMemOff_size_ge (lkm : LinkModel) (op : StoreOp) (base rs tmp : Reg) (off : Int) :
-    1 ≤ lkm.totalSize (storeMemOff op base rs tmp off) := by
-  dsimp only [storeMemOff]
-  split
-  · simp only [Asm.raw, lkm.totalSize_instr, Nat.le_refl]
-  · split
-    · simp only [lkm.totalSize_cons, lkm.totalSize_nil,
-        Asm.addi, Asm.raw, lkm.itemSize_instr]; omega
-    · split
-      · simp only [lkm.totalSize_cons, lkm.totalSize_nil,
-          Asm.add, Asm.raw, lkm.itemSize_instr]; omega
-      · simp only [lkm.totalSize_append, lkm.totalSize_cons,
-          lkm.totalSize_nil, Asm.add, Asm.raw, lkm.itemSize_instr]; omega
+theorem romWords32_length (bs : List UInt8) :
+    (romWords32 bs).length = (bs.length + 3) / 4 := by
+  match bs with
+  | [] => simp [romWords32]
+  | [_] | [_, _] | [_, _, _] => simp [romWords32]
+  | _ :: _ :: _ :: _ :: rest =>
+    simp only [romWords32, List.length_cons]
+    rw [romWords32_length rest]; omega
 
-private theorem drvRomStoresGo_size_ge (lkm : LinkModel) (romBase : Int) (idx : Nat) (ws : List (BitVec 64)) :
-    ws.length ≤ lkm.totalSize (drvRomStoresGo romBase idx ws) := by
-  induction ws generalizing idx with
-  | nil => simp [drvRomStoresGo]
-  | cons w ws ih =>
-    simp only [drvRomStoresGo, List.length_cons, lkm.totalSize_append]
-    have h1 := storeMemOff_size_ge lkm .sd AbiReg.gp AbiReg.t1 AbiReg.t0 (romBase + 8 * (idx : Int))
-    have hih := ih (idx + 1)
+private theorem romWord32_extract_byte (b0 b1 b2 b3 : UInt8) (j : Nat) (hj : j < 4) :
+    (romWord32 b0 b1 b2 b3).extractLsb' (8 * j) 8 =
+      (if j = 0 then b0 else if j = 1 then b1 else if j = 2 then b2 else b3).toBitVec := by
+  apply BitVec.eq_of_getLsbD_eq
+  intro i hi
+  have hlt8 : ∀ (b : UInt8) (m : Nat), 8 ≤ m → b.toBitVec.getLsbD m = false :=
+    fun b m hm => BitVec.getLsbD_of_ge b.toBitVec m hm
+  simp only [BitVec.getLsbD_extractLsb', show i < 8 from hi, decide_true, Bool.true_and,
+    romWord32, BitVec.getLsbD_or, BitVec.getLsbD_shiftLeft]
+  rcases j with _ | _ | _ | _ | j'
+  · simp [show i < 32 by omega, show i < 8 from hi, show i < 16 by omega, show i < 24 by omega]
+  · simp [show 8 + i < 32 by omega, show ¬(8 + i < 8) by omega, show 8 + i < 16 by omega,
+      show 8 + i < 24 by omega, show i < 8 from hi, show i < 32 by omega]
+  · simp [show 16 + i < 32 by omega, show ¬(16 + i < 8) by omega, show ¬(16 + i < 16) by omega,
+      show 16 + i < 24 by omega, hlt8 b0 (16 + i) (by omega), hlt8 b1 (16 + i - 8) (by omega),
+      show i < 8 from hi, show i < 32 by omega]
+  · simp [show 24 + i < 32 by omega, show ¬(24 + i < 8) by omega, show ¬(24 + i < 16) by omega,
+      show ¬(24 + i < 24) by omega, hlt8 b0 (24 + i) (by omega), hlt8 b1 (24 + i - 8) (by omega),
+      hlt8 b2 (24 + i - 16) (by omega), show i < 8 from hi, show i < 32 by omega]
+  · omega
+
+theorem romWords32_getElem (bs : List UInt8) (k : Nat) (hk : k < bs.length) :
+    k / 4 < (romWords32 bs).length ∧
+    ((romWords32 bs)[k / 4]'(by rw [romWords32_length]; omega)).extractLsb' (8 * (k % 4)) 8 = bs[k].toBitVec := by
+  match bs with
+  | [] => simp at hk
+  | [b0] =>
+    have hk0 : k = 0 := by simp at hk; omega
+    subst hk0; exact ⟨by simp [romWords32], romWord32_extract_byte b0 0 0 0 0 (by decide)⟩
+  | [b0, b1] =>
+    have hk2 : k < 2 := by simpa using hk
+    have hkdiv : k / 4 = 0 := Nat.div_eq_of_lt (by omega)
+    have hkmod : k % 4 = k := Nat.mod_eq_of_lt (by omega)
+    refine ⟨by rw [hkdiv]; simp [romWords32], ?_⟩
+    simp only [romWords32, hkdiv, List.getElem_cons_zero, hkmod]
+    rw [romWord32_extract_byte b0 b1 0 0 k (by omega)]
+    rcases k with _ | _ | k' <;> first | rfl | omega
+  | [b0, b1, b2] =>
+    have hk3 : k < 3 := by simpa using hk
+    have hkdiv : k / 4 = 0 := Nat.div_eq_of_lt (by omega)
+    have hkmod : k % 4 = k := Nat.mod_eq_of_lt (by omega)
+    refine ⟨by rw [hkdiv]; simp [romWords32], ?_⟩
+    simp only [romWords32, hkdiv, List.getElem_cons_zero, hkmod]
+    rw [romWord32_extract_byte b0 b1 b2 0 k (by omega)]
+    rcases k with _ | _ | _ | k' <;> first | rfl | omega
+  | b0 :: b1 :: b2 :: b3 :: rest =>
+    by_cases hk4 : k < 4
+    · have hkdiv : k / 4 = 0 := Nat.div_eq_of_lt hk4
+      have hkmod : k % 4 = k := Nat.mod_eq_of_lt hk4
+      refine ⟨by rw [romWords32_length]; omega, ?_⟩
+      simp only [romWords32, hkdiv, List.getElem_cons_zero, hkmod]
+      rw [romWord32_extract_byte b0 b1 b2 b3 k hk4]
+      rcases k with _ | _ | _ | _ | k' <;> first | rfl | omega
+    · have hkgt : 4 ≤ k := Nat.le_of_not_lt hk4
+      have hlenCons : (b0 :: b1 :: b2 :: b3 :: rest).length = rest.length + 4 := rfl
+      have hkrest : k - 4 < rest.length := by rw [hlenCons] at hk; omega
+      obtain ⟨_, h2⟩ := romWords32_getElem rest (k - 4) hkrest
+      have hdiv : k / 4 = (k - 4) / 4 + 1 := by omega
+      have hmod : k % 4 = (k - 4) % 4 := by omega
+      refine ⟨by rw [hlenCons] at hk; rw [romWords32_length]; omega, ?_⟩
+      simp only [romWords32, hdiv, List.getElem_cons_succ, hmod]
+      have htailEq : (b0 :: b1 :: b2 :: b3 :: rest)[k] = rest[k - 4] := by
+        rcases k with _ | _ | _ | _ | k' <;> first | omega | simp
+      rw [htailEq]
+      exact h2
+
+def romGroupPairs (gs : List (BitVec 32 × List Nat)) : List (Nat × BitVec 32) :=
+  gs.flatMap fun (v, slots) => slots.map fun s => (s, v)
+
+theorem romGroupPairs_insertGroup_perm (slot : Nat) (v : BitVec 32)
+    (gs : List (BitVec 32 × List Nat)) :
+    (romGroupPairs (romInsertGroup slot v gs)).Perm ((slot, v) :: romGroupPairs gs) := by
+  induction gs with
+  | nil => simp [romInsertGroup, romGroupPairs]
+  | cons g rest ih =>
+    rcases g with ⟨k, ss⟩
+    dsimp only [romInsertGroup]
+    by_cases hkv : k == v
+    · have hk : k = v := beq_iff_eq.mp hkv
+      subst hk
+      simp [romGroupPairs]
+    · simp only [hkv, Bool.false_eq_true, ↓reduceIte, romGroupPairs, List.flatMap_cons]
+      exact (ih.append_left _).trans List.perm_middle
+
+theorem romGroupPairs_groupChunkGo_perm (base : Nat) (ws : List (BitVec 32)) :
+    (romGroupPairs (romGroupChunkGo base ws)).Perm ((ws.zipIdx base).map Prod.swap) := by
+  induction ws generalizing base with
+  | nil => simp [romGroupChunkGo, romGroupPairs]
+  | cons w rest ih =>
+    simp only [romGroupChunkGo, List.zipIdx_cons, List.map_cons, Prod.swap]
+    exact (romGroupPairs_insertGroup_perm base w _).trans ((ih (base + 1)).cons (base, w))
+
+theorem romGroupPairs_groupChunk_perm (ws : List (BitVec 32)) :
+    (romGroupPairs (romGroupChunk ws)).Perm (ws.zipIdx.map Prod.swap) :=
+  romGroupPairs_groupChunkGo_perm 0 ws
+
+private theorem zipIdx_swap_map_fst (base : Nat) (ws : List (BitVec 32)) :
+    ((ws.zipIdx base).map Prod.swap).map Prod.fst = List.range' base ws.length := by
+  induction ws generalizing base with
+  | nil => simp
+  | cons w rest ih =>
+    simp only [List.zipIdx_cons, List.map_cons, Prod.swap, List.length_cons, List.range']
+    rw [ih (base + 1)]
+
+theorem romGroupChunk_nodup (ws : List (BitVec 32)) :
+    ((romGroupPairs (romGroupChunk ws)).map Prod.fst).Nodup := by
+  have hperm : ((romGroupPairs (romGroupChunk ws)).map Prod.fst).Perm (List.range' 0 ws.length) := by
+    rw [← zipIdx_swap_map_fst 0 ws]
+    exact (romGroupPairs_groupChunk_perm ws).map Prod.fst
+  exact hperm.symm.nodup (List.nodup_range' ..)
+
+private theorem mem_zipIdx_swap_of_lt (base : Nat) (ws : List (BitVec 32)) (s : Nat)
+    (hs : s < ws.length) :
+    (base + s, ws[s]) ∈ (ws.zipIdx base).map Prod.swap := by
+  induction ws generalizing base s with
+  | nil => simp at hs
+  | cons w rest ih =>
+    cases s with
+    | zero =>
+      simp only [List.zipIdx_cons, List.map_cons, Prod.swap, Nat.add_zero, List.getElem_cons_zero,
+        List.mem_cons, true_or]
+    | succ s' =>
+      simp only [List.zipIdx_cons, List.map_cons, Prod.swap, List.getElem_cons_succ, List.mem_cons]
+      right
+      simpa only [Nat.add_assoc, Nat.add_comm 1 s'] using ih (base + 1) s' (by simpa using hs)
+
+theorem romGroupChunk_mem_of_lt (ws : List (BitVec 32)) (s : Nat) (hs : s < ws.length) :
+    (s, ws[s]) ∈ romGroupPairs (romGroupChunk ws) := by
+  rw [(romGroupPairs_groupChunk_perm ws).mem_iff]
+  simpa only [Nat.zero_add] using mem_zipIdx_swap_of_lt 0 ws s hs
+
+private theorem mem_zipIdx_swap_lt (base : Nat) (ws : List (BitVec 32)) {p : Nat × BitVec 32}
+    (hp : p ∈ (ws.zipIdx base).map Prod.swap) :
+    base ≤ p.1 ∧ p.1 - base < ws.length ∧ ∃ (h : p.1 - base < ws.length), ws[p.1 - base]'h = p.2 := by
+  induction ws generalizing base with
+  | nil => simp at hp
+  | cons w rest ih =>
+    simp only [List.zipIdx_cons, List.map_cons, Prod.swap, List.mem_cons] at hp
+    rcases hp with rfl | hp'
+    · exact ⟨Nat.le_refl _, by simp, by simp, by simp⟩
+    · obtain ⟨hge, hlt, hlt', heq⟩ := ih (base + 1) hp'
+      have hsub : p.1 - base = (p.1 - (base + 1)) + 1 := by omega
+      refine ⟨by omega, by simp; omega, by simp; omega, ?_⟩
+      simp only [hsub, List.getElem_cons_succ]
+      exact heq
+
+theorem romGroupChunk_mem_lt (ws : List (BitVec 32)) {p : Nat × BitVec 32}
+    (hp : p ∈ romGroupPairs (romGroupChunk ws)) :
+    p.1 < ws.length ∧ ∃ (h : p.1 < ws.length), ws[p.1]'h = p.2 := by
+  rw [(romGroupPairs_groupChunk_perm ws).mem_iff] at hp
+  obtain ⟨_, hlt, hlt', heq⟩ := mem_zipIdx_swap_lt 0 ws hp
+  simpa only [Nat.sub_zero] using ⟨hlt, hlt', heq⟩
+
+theorem romChunks1024_flatten {α : Type} (xs : List α) :
+    (romChunks1024 xs).flatten = xs := by
+  match xs with
+  | [] => simp [romChunks1024]
+  | x :: xs' =>
+    rw [romChunks1024, List.flatten_cons, romChunks1024_flatten ((x :: xs').drop 1024),
+      List.take_append_drop]
+termination_by xs.length
+decreasing_by simp [List.length_drop]; omega
+
+theorem romChunks1024_chunk_le {α : Type} (xs : List α) :
+    ∀ c ∈ romChunks1024 xs, c.length ≤ 1024 := by
+  match xs with
+  | [] => simp [romChunks1024]
+  | x :: xs' =>
+    intro c hc
+    rw [romChunks1024, List.mem_cons] at hc
+    rcases hc with rfl | hc'
+    · exact List.length_take_le _ _
+    · exact romChunks1024_chunk_le ((x :: xs').drop 1024) c hc'
+termination_by xs.length
+decreasing_by simp [List.length_drop]; omega
+
+theorem romChunks1024_init_length {α : Type} (xs : List α) (i : Nat)
+    (hi : i + 1 < (romChunks1024 xs).length) :
+    (romChunks1024 xs)[i].length = 1024 := by
+  match xs with
+  | [] => simp [romChunks1024] at hi
+  | x :: xs' =>
+    have hdef : romChunks1024 (x :: xs') = (x :: xs').take 1024 :: romChunks1024 ((x :: xs').drop 1024) := by
+      rw [romChunks1024]
+    cases i with
+    | zero =>
+      have hpos : 0 < (romChunks1024 ((x :: xs').drop 1024)).length := by
+        rw [hdef, List.length_cons] at hi; omega
+      have hdrop : ((x :: xs').drop 1024).length ≠ 0 := by
+        intro hz
+        have hnil : (x :: xs').drop 1024 = [] := List.eq_nil_of_length_eq_zero hz
+        rw [hnil, romChunks1024] at hpos; simp at hpos
+      rw [List.length_drop] at hdrop
+      simp only [hdef, List.getElem_cons_zero, List.length_take]
+      simp only [List.length_cons] at hdrop ⊢
+      omega
+    | succ i' =>
+      have hi' : i' + 1 < (romChunks1024 ((x :: xs').drop 1024)).length := by
+        rw [hdef, List.length_cons] at hi; omega
+      simpa only [hdef, List.getElem_cons_succ] using
+        romChunks1024_init_length ((x :: xs').drop 1024) i' hi'
+termination_by xs.length
+decreasing_by simp [List.length_drop]; omega
+
+theorem romChunks1024_prefix_len {α : Type} (xs : List α) (ci : Nat)
+    (hci : ci < (romChunks1024 xs).length) :
+    (((romChunks1024 xs).take ci).map List.length).sum = 1024 * ci := by
+  match xs with
+  | [] => simp [romChunks1024] at hci
+  | x :: xs' =>
+    have hdef : romChunks1024 (x :: xs') = (x :: xs').take 1024 :: romChunks1024 ((x :: xs').drop 1024) := by
+      rw [romChunks1024]
+    cases ci with
+    | zero => simp
+    | succ ci' =>
+      have h0 : 0 + 1 < (romChunks1024 (x :: xs')).length := by
+        rw [hdef, List.length_cons] at hci ⊢; omega
+      have hlen0 := romChunks1024_init_length (x :: xs') 0 h0
+      simp only [hdef, List.getElem_cons_zero] at hlen0
+      have hci' : ci' < (romChunks1024 ((x :: xs').drop 1024)).length := by
+        rw [hdef, List.length_cons] at hci; omega
+      have ih := romChunks1024_prefix_len ((x :: xs').drop 1024) ci' hci'
+      rw [hdef, List.take_succ_cons, List.map_cons, List.sum_cons, hlen0, ih]
+      omega
+termination_by xs.length
+decreasing_by simp [List.length_drop]; omega
+
+theorem romChunks1024_chunk_getElem {α : Type} (xs : List α) (ci j : Nat)
+    (hci : ci < (romChunks1024 xs).length) (hj : j < (romChunks1024 xs)[ci].length) :
+    ∃ h : 1024 * ci + j < xs.length, xs[1024 * ci + j]'h = (romChunks1024 xs)[ci][j] := by
+  match xs with
+  | [] => simp [romChunks1024] at hci
+  | x :: xs' =>
+    have hdef : romChunks1024 (x :: xs') = (x :: xs').take 1024 :: romChunks1024 ((x :: xs').drop 1024) := by
+      rw [romChunks1024]
+    cases ci with
+    | zero =>
+      simp only [hdef, List.getElem_cons_zero, List.length_take] at hj
+      refine ⟨by omega, ?_⟩
+      simp only [Nat.mul_zero, Nat.zero_add, hdef, List.getElem_cons_zero, List.getElem_take]
+    | succ ci' =>
+      have hci' : ci' < (romChunks1024 ((x :: xs').drop 1024)).length := by
+        rw [hdef, List.length_cons] at hci; omega
+      have hj' : j < (romChunks1024 ((x :: xs').drop 1024))[ci'].length := by
+        simpa only [hdef, List.getElem_cons_succ] using hj
+      obtain ⟨hlt, heq⟩ := romChunks1024_chunk_getElem ((x :: xs').drop 1024) ci' j hci' hj'
+      rw [List.length_drop] at hlt
+      have hidx : 1024 * (ci' + 1) + j = 1024 + (1024 * ci' + j) := by omega
+      refine ⟨by omega, ?_⟩
+      simp only [hdef, List.getElem_cons_succ, ← heq, List.getElem_drop]
+      congr 1
+termination_by xs.length
+decreasing_by simp [List.length_drop]; omega
+
+private theorem list_flatten_length {α : Type} (ls : List (List α)) :
+    ls.flatten.length = (ls.map List.length).sum := by
+  induction ls with
+  | nil => simp
+  | cons l ls ih => simp [List.flatten_cons, ih]
+
+private theorem list_flatten_length_le {α : Type} (ls : List (List α)) (K : Nat)
+    (hK : ∀ c ∈ ls, c.length ≤ K) : ls.flatten.length ≤ K * ls.length := by
+  induction ls with
+  | nil => simp
+  | cons l ls ih =>
+    have hl : l.length ≤ K := hK l (List.mem_cons_self ..)
+    have hls : ls.flatten.length ≤ K * ls.length := ih fun c hc => hK c (List.mem_cons_of_mem _ hc)
+    simp only [List.flatten_cons, List.length_append, List.length_cons, Nat.mul_add, Nat.mul_one]
     omega
+
+private theorem list_eq_take_append_last {α : Type} (ls : List α) (k : Nat)
+    (hk : ls.length = k + 1) : ∃ h : k < ls.length, ls = ls.take k ++ [ls[k]'h] := by
+  have hklt : k < ls.length := by omega
+  refine ⟨hklt, ?_⟩
+  have hhd := List.take_append_drop k ls
+  have hdrop : ls.drop k = [ls[k]'hklt] := by
+    have hlen : (ls.drop k).length = 1 := by rw [List.length_drop]; omega
+    match hd : ls.drop k with
+    | [] => simp [hd] at hlen
+    | [a] =>
+      have ha : a = ls[k]'hklt := by
+        have hlen' : 0 < (ls.drop k).length := by omega
+        have h0 : (ls.drop k)[0]'hlen' = a := by simp [hd]
+        rw [List.getElem_drop] at h0
+        simpa using h0.symm
+      subst ha; rfl
+    | _ :: _ :: _ => simp [hd] at hlen
+  calc
+    ls = ls.take k ++ ls.drop k := hhd.symm
+    _ = ls.take k ++ [ls[k]'hklt] := by rw [hdrop]
+
+theorem romChunks1024_getElem {α : Type} (xs : List α) (idx : Nat) (hidx : idx < xs.length) :
+    ∃ h1 : idx / 1024 < (romChunks1024 xs).length,
+    ∃ h2 : idx % 1024 < ((romChunks1024 xs)[idx / 1024]'h1).length,
+      ((romChunks1024 xs)[idx / 1024]'h1)[idx % 1024]'h2 = xs[idx] := by
+  have hfl : (romChunks1024 xs).flatten.length = xs.length :=
+    congrArg List.length (romChunks1024_flatten xs)
+  have hbound : xs.length ≤ 1024 * (romChunks1024 xs).length := by
+    rw [← hfl]
+    exact list_flatten_length_le (romChunks1024 xs) 1024 (romChunks1024_chunk_le xs)
+  have h1 : idx / 1024 < (romChunks1024 xs).length := by omega
+  have h2 : idx % 1024 < ((romChunks1024 xs)[idx / 1024]'h1).length := by
+    by_cases hmid : idx / 1024 + 1 < (romChunks1024 xs).length
+    · rw [romChunks1024_init_length xs (idx / 1024) hmid]
+      exact Nat.mod_lt idx (by decide)
+    · have hlast : (romChunks1024 xs).length = idx / 1024 + 1 := by omega
+      obtain ⟨h1', hsplit⟩ := list_eq_take_append_last (romChunks1024 xs) (idx / 1024) hlast
+      have hsum : xs.length =
+          (((romChunks1024 xs).take (idx / 1024)).map List.length).sum +
+            ((romChunks1024 xs)[idx / 1024]'h1).length := by
+        rw [← hfl, list_flatten_length]
+        calc
+          ((romChunks1024 xs).map List.length).sum
+              = ((List.take (idx / 1024) (romChunks1024 xs) ++
+                  [(romChunks1024 xs)[idx / 1024]'h1]).map List.length).sum := by
+                have hc : romChunks1024 xs =
+                    List.take (idx / 1024) (romChunks1024 xs) ++ [(romChunks1024 xs)[idx / 1024]'h1] := by
+                  simpa using hsplit
+                exact congrArg (fun l => (l.map List.length).sum) hc
+          _ = (((romChunks1024 xs).take (idx / 1024)).map List.length).sum +
+                ((romChunks1024 xs)[idx / 1024]'h1).length := by
+              rw [List.map_append, List.sum_append]
+              simp
+      rw [romChunks1024_prefix_len xs (idx / 1024) h1] at hsum
+      omega
+  refine ⟨h1, h2, ?_⟩
+  obtain ⟨hlt, heq⟩ := romChunks1024_chunk_getElem xs (idx / 1024) (idx % 1024) h1 h2
+  rw [← heq]
+  have hidx_eq : ∀ {m n : Nat} (hm : m < xs.length) (hn : n < xs.length),
+      m = n → xs[m]'hm = xs[n]'hn := by
+    rintro m n hm hn rfl; rfl
+  exact hidx_eq hlt hidx (by omega)
+
+private theorem sw_map_totalSize (lkm : LinkModel) (r1 r2 : Reg) (offFn : Nat → BitVec 12)
+    (slots : List Nat) :
+    lkm.totalSize (slots.map fun s => Asm.sw r1 r2 (offFn s)) = slots.length := by
+  induction slots with
+  | nil => simp
+  | cons s ss ih =>
+    rw [List.map_cons, lkm.totalSize_cons, ih, List.length_cons]
+    simp [Asm.sw, lkm.itemSize_instr]; omega
+
+private theorem drvRomGroupAsm_size_ge (lkm : LinkModel) (g : BitVec 32 × List Nat) :
+    g.2.length ≤ lkm.totalSize (drvRomGroupAsm g) := by
+  rcases g with ⟨v, slots⟩
+  dsimp only [drvRomGroupAsm]
+  split
+  · rw [sw_map_totalSize]; exact Nat.le_refl _
+  · rw [lkm.totalSize_append, sw_map_totalSize]; omega
+
+private theorem drvRomGroupAsm_flatMap_size_ge (lkm : LinkModel)
+    (gs : List (BitVec 32 × List Nat)) :
+    (romGroupPairs gs).length ≤ lkm.totalSize (gs.flatMap drvRomGroupAsm) := by
+  induction gs with
+  | nil => simp [romGroupPairs]
+  | cons g gs ih =>
+    have hrest := ih
+    rw [List.flatMap_cons, lkm.totalSize_append]
+    dsimp only [romGroupPairs]
+    rw [List.flatMap_cons, List.length_append, List.length_map]
+    have h1 := drvRomGroupAsm_size_ge lkm g
+    dsimp only [romGroupPairs] at hrest
+    omega
+
+private theorem drvRomChunkAsm_size_ge (lkm : LinkModel) (romBase : Int) (ci : Nat)
+    (ws : List (BitVec 32)) :
+    ws.length ≤ lkm.totalSize (drvRomChunkAsm romBase ci ws) := by
+  have hlen : ws.length = (romGroupPairs (romGroupChunk ws)).length := by
+    have hp := (romGroupPairs_groupChunk_perm ws).length_eq
+    simpa [List.length_map, List.length_zipIdx] using hp.symm
+  rw [hlen]
+  dsimp only [drvRomChunkAsm]
+  rw [lkm.totalSize_append]
+  have hfm := drvRomGroupAsm_flatMap_size_ge lkm (romGroupChunk ws)
+  omega
+
+private theorem drvRomStoresAsm_size_ge (lkm : LinkModel) (romBase : Int) (bs : List UInt8) :
+    (romWords32 bs).length ≤ lkm.totalSize (drvRomStoresAsm romBase bs) := by
+  have hgen : ∀ (k : Nat) (chunks : List (List (BitVec 32))),
+      chunks.flatten.length ≤
+        lkm.totalSize ((chunks.zipIdx k).flatMap fun (ws, ci) => drvRomChunkAsm romBase ci ws) := by
+    intro k chunks
+    induction chunks generalizing k with
+    | nil => simp
+    | cons c cs ih =>
+      simp only [List.flatten_cons, List.length_append, List.zipIdx_cons, List.flatMap_cons,
+        lkm.totalSize_append]
+      have h1 := drvRomChunkAsm_size_ge lkm romBase k c
+      have h2 := ih (k + 1)
+      dsimp only at h2 ⊢
+      omega
+  have hfl := congrArg List.length (romChunks1024_flatten (romWords32 bs))
+  rw [← hfl]
+  exact hgen 0 (romChunks1024 (romWords32 bs))
 
 theorem checkerTabMini_romWords_lt : checkerTabMini.romWords < 2 ^ 22 := by
   have htot := checkerChipAsm_farTotalWords_lt
   have hle : checkerLM.totalSize checkerChipAsm ≤ farTotalWords checkerChipAsm :=
     hybrid_totalSize_le_far _ checkerChipAsm
-  have hromSub : checkerLM.totalSize (drvRomStoresGo checkerTabMini.romBase 0 (romWords64 checkerTabMini.rom)) ≤
+  have hromSub : checkerLM.totalSize (drvRomStoresAsm checkerTabMini.romBase checkerTabMini.rom) ≤
       checkerLM.totalSize checkerChipAsm := by
     rw [checkerChipAsm_eq, checkerDriverAsm_decomp, drvInitSubAsm_decomp]
     dsimp only [drvInitBody]
     simp only [checkerLM.totalSize_append]
     omega
-  have hlen := drvRomStoresGo_size_ge checkerLM checkerTabMini.romBase 0 (romWords64 checkerTabMini.rom)
-  rw [romWords64_length] at hlen
-  change checkerTabMini.romWords ≤ _ at hlen
+  have hlen := drvRomStoresAsm_size_ge checkerLM checkerTabMini.romBase checkerTabMini.rom
+  rw [romWords32_length] at hlen
+  change (checkerTabMini.rom.length + 7) / 8 < 2 ^ 22
   omega
 
 theorem checkerTabMini_args_lt : checkerTabMini.args.toNat + 8 ≤ abiSlot := by
