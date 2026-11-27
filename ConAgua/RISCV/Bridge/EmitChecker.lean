@@ -386,6 +386,17 @@ private def hexDigit (n : Nat) : Char :=
   if n < 10 then Char.ofNat ('0'.toNat + n)
   else Char.ofNat ('a'.toNat + (n - 10))
 
+private def hexNat (digits n : Nat) : String :=
+  Id.run do
+    let mut acc : List Char := []
+    let mut v := n
+    let mut k := 0
+    while v > 0 || k < digits do
+      acc := hexDigit (v &&& 0xf) :: acc
+      v := v >>> 4
+      k := k + 1
+    return String.ofList acc
+
 private def hexWord32 (w : BitVec 32) : String :=
   let v := w.toNat
   String.ofList [
@@ -400,21 +411,141 @@ private def hexWord32 (w : BitVec 32) : String :=
     hexDigit (v &&& 0xf)
   ]
 
-private def writeWords (h : IO.FS.Handle) (words : Array (BitVec 32)) : IO Unit := do
-  let n := words.size
-  let mut i := 0
-  while i < n do
-    let stop := min (i + 8) n
-    let mut line := "\t.word "
-    let mut j := i
-    while j < stop do
-      if j > i then
-        line := line ++ ", "
-      let w := if hj : j < words.size then words[j] else 0#32
-      line := line ++ hexWord32 w
-      j := j + 1
-    h.putStrLn line
-    i := stop
+private def abiRegNames : Array String := #[
+  "zero", "ra", "sp", "gp", "tp", "t0", "t1", "t2",
+  "s0", "s1", "a0", "a1", "a2", "a3", "a4", "a5",
+  "a6", "a7", "s2", "s3", "s4", "s5", "s6", "s7",
+  "s8", "s9", "s10", "s11", "t3", "t4", "t5", "t6"
+]
+
+private def regName (r : ConAgua.RISCV.RV64.Reg) : String :=
+  abiRegNames.getD r.toNat s!"x{r.toNat}"
+
+private def pad6 (s : String) : String :=
+  if s.length ≥ 6 then s
+  else s ++ String.ofList (List.replicate (6 - s.length) ' ')
+
+private def aluImmOpName : ConAgua.RISCV.RV64.AluImmOp → String
+  | .addi => "addi"
+  | .slti => "slti"
+  | .sltiu => "sltiu"
+  | .andi => "andi"
+  | .ori => "ori"
+  | .xori => "xori"
+
+private def shiftImmOpName : ConAgua.RISCV.RV64.ShiftImmOp → String
+  | .slli => "slli"
+  | .srli => "srli"
+
+private def aluOpName : ConAgua.RISCV.RV64.AluOp → String
+  | .add => "add"
+  | .sub => "sub"
+  | .slt => "slt"
+  | .sltu => "sltu"
+  | .and => "and"
+  | .or => "or"
+  | .xor => "xor"
+  | .sll => "sll"
+  | .srl => "srl"
+  | .mul => "mul"
+  | .mulhu => "mulhu"
+
+private def branchOpName : ConAgua.RISCV.RV64.BranchOp → String
+  | .beq => "beq"
+  | .bne => "bne"
+  | .blt => "blt"
+  | .bltu => "bltu"
+  | .bge => "bge"
+  | .bgeu => "bgeu"
+
+private def loadOpName : ConAgua.RISCV.RV64.LoadOp → String
+  | .ld => "ld"
+  | .lwu => "lwu"
+  | .lbu => "lbu"
+
+private def storeOpName : ConAgua.RISCV.RV64.StoreOp → String
+  | .sd => "sd"
+  | .sw => "sw"
+
+private def signedInt (i : Int) : String :=
+  if i ≥ 0 then s!"+{i}" else s!"{i}"
+
+private def hexPc (pc : Int) : String :=
+  if pc ≥ 0 then hexNat 6 pc.toNat else s!"-{hexNat 6 (-pc).toNat}"
+
+private def targetLabelSuffix (labelMap : Std.HashMap Nat (List String)) (tgt : Int) : String :=
+  if tgt ≥ 0 && tgt % 4 == 0 then
+    match labelMap[tgt.toNat / 4]? with
+    | some (lbl :: _) => s!" {lbl}"
+    | _ => ""
+  else ""
+
+private def disasmWord32 (labelMap : Std.HashMap Nat (List String)) (pc : Nat) (w : BitVec 32) : String :=
+  match ConAgua.RISCV.RV64.decode w with
+  | none => "<illegal>"
+  | some (.aluImm op rd rs1 imm12) =>
+    s!"{pad6 (aluImmOpName op)} {regName rd}, {regName rs1}, {imm12.toInt}"
+  | some (.shImm op rd rs1 shamt) =>
+    s!"{pad6 (shiftImmOpName op)} {regName rd}, {regName rs1}, {shamt.toNat}"
+  | some (.lui rd imm20) =>
+    s!"lui    {regName rd}, 0x{hexNat 5 imm20.toNat}"
+  | some (.alu op rd rs1 rs2) =>
+    s!"{pad6 (aluOpName op)} {regName rd}, {regName rs1}, {regName rs2}"
+  | some (.jal rd jimm) =>
+    let off := 2 * jimm.toInt
+    let tgt := (pc : Int) + off
+    s!"jal    {regName rd}, {signedInt off} (-> 0x{hexPc tgt}{targetLabelSuffix labelMap tgt})"
+  | some (.jalr rd rs1 imm12) =>
+    let retNote := if rd == 0#5 && rs1 == 1#5 && imm12 == 0#12 then " ; ret" else ""
+    s!"jalr   {regName rd}, {imm12.toInt}({regName rs1}){retNote}"
+  | some (.branch op rs1 rs2 bimm) =>
+    let off := 2 * bimm.toInt
+    let tgt := (pc : Int) + off
+    s!"{pad6 (branchOpName op)} {regName rs1}, {regName rs2}, {signedInt off} (-> 0x{hexPc tgt}{targetLabelSuffix labelMap tgt})"
+  | some (.load op rd rs1 imm12) =>
+    s!"{pad6 (loadOpName op)} {regName rd}, {imm12.toInt}({regName rs1})"
+  | some (.store op rs1 rs2 imm12) =>
+    s!"{pad6 (storeOpName op)} {regName rs2}, {imm12.toInt}({regName rs1})"
+
+private def buildLabelMap (lm : ConAgua.RISCV.Linker.LinkModel)
+    (items : List ConAgua.RISCV.Compiler.AsmItem) : Std.HashMap Nat (List String) :=
+  Id.run do
+    let mut m : Std.HashMap Nat (List String) := ∅
+    let mut wordOff := 0
+    for it in items do
+      match it with
+      | .label s =>
+        let prev := m.getD wordOff []
+        m := m.insert wordOff (prev ++ [s])
+      | _ => pure ()
+      wordOff := wordOff + lm.itemSize it
+    return m
+
+private def writeWords (h : IO.FS.Handle) (labelMap : Std.HashMap Nat (List String))
+    (words : Array (BitVec 32)) (startIdx stopIdx : Nat) : IO Unit := do
+  let stop := min stopIdx words.size
+  let mut i := startIdx
+  let mut buf := ""
+  let mut batch := 0
+  while i < stop do
+    let w := if hi : i < words.size then words[i] else 0#32
+    let pc := 4 * i
+    let dis := disasmWord32 labelMap pc w
+    let lblSuffix :=
+      match labelMap[i]? with
+      | some lbls =>
+        let lblStr := ", ".intercalate lbls
+        s!"  [{lblStr}]"
+      | none => ""
+    buf := buf ++ s!"\t.word {hexWord32 w}\t# {hexNat 6 pc}: {dis}{lblSuffix}\n"
+    batch := batch + 1
+    if batch ≥ 256 then
+      h.putStr buf
+      buf := ""
+      batch := 0
+    i := i + 1
+  if !buf.isEmpty then
+    h.putStr buf
 
 private def writeQuad (h : IO.FS.Handle) (name : String) (val : Nat) : IO Unit := do
   h.putStrLn s!"\t.globl {name}"
@@ -435,6 +566,7 @@ private def runAsmMode (outPath : System.FilePath) : IO UInt32 := do
     if cmpEntryWord ≥ words.size then
       IO.eprintln s!"invalid ca_start_c offset {cmpEntryWord} ≥ {words.size}"
       return 1
+    let labelMap := buildLabelMap lm items
     let slot := ConAgua.RISCV.Compiler.abiSlot
     let regionSize := ConAgua.RISCV.Compiler.abiNeed tab
     if let some dir := outPath.parent then
@@ -444,10 +576,10 @@ private def runAsmMode (outPath : System.FilePath) : IO UInt32 := do
       h.putStrLn "\t.balign 4"
       h.putStrLn "\t.globl ca_start"
       h.putStrLn "ca_start:"
-      writeWords h (words.extract 0 cmpEntryWord)
+      writeWords h labelMap words 0 cmpEntryWord
       h.putStrLn "\t.globl ca_start_c"
       h.putStrLn "ca_start_c:"
-      writeWords h (words.extract cmpEntryWord words.size)
+      writeWords h labelMap words cmpEntryWord words.size
       h.putStrLn "\t.section .rodata"
       h.putStrLn "\t.balign 8"
       writeQuad h "ca_region_size" regionSize
