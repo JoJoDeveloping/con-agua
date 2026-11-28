@@ -1,6 +1,6 @@
 name = "ConAgua"
 version = "0.1.0"
-defaultTargets = ["ConAgua", "ConAguaX86", "ConAguaAsm", "ConLeche", "ConRonArena", "ConRonBridge"]
+defaultTargets = ["ConAgua", "ConAguaX86", "ConAguaAsm", "ConAguaRISCV", "ConLeche", "ConRonArena", "ConRonBridge"]
 
 [leanOptions]
 autoImplicit = false
@@ -1145,3 +1145,13 @@ root = "ConAgua.X86.E2E.Main"
 [[lean_exe]]
 name = "compopt-asm"
 root = "ConAgua.X86.E2E.AsmOpt"
+
+[[lean_lib]]
+name = "ConAguaRISCV"
+allowNonModules = true
+roots = ["ConAguaRISCV", "ConAgua.RISCV"]
+globs = ["ConAguaRISCV", "ConAgua.RISCV.+"]
+
+[[lean_exe]]
+name = "emit-checker"
+root = "ConAgua.RISCV.Bridge.EmitChecker"

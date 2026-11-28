@@ -3,3 +3,5 @@ _tmp
 _scratch/
 __pycache__/
 /x86/checker
+/riscv/checker
+/riscv/main.c
