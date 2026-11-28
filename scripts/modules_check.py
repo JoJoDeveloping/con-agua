@@ -17,12 +17,13 @@ for l in targets:
     listed |= set(l.get("globs", [])) | set(l.get("roots", []))
     if "root" in l:
         listed.add(l["root"])
-files = {f[:-5].replace("/", ".") for f in glob.glob("ConAgua/**/*.lean", recursive=True)} | {"ConAgua"}
+roots_top = {f[:-5] for f in glob.glob("ConAgua*.lean")}
+files = {f[:-5].replace("/", ".") for f in glob.glob("ConAgua/**/*.lean", recursive=True)} | roots_top
 IMP = re.compile(r"^(?:public |private )?(?:meta )?import (?:all )?(ConAgua[\w.]*)", re.M)
 
 
 def imports(m):
-    p = "ConAgua.lean" if m == "ConAgua" else m.replace(".", "/") + ".lean"
+    p = m.replace(".", "/") + ".lean"
     return set(IMP.findall(open(p, encoding="utf-8", errors="replace").read()))
 
 

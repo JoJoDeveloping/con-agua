@@ -1,4 +1,4 @@
-/* Driver for code compiled from L (ConAgua/Compiler): loads a file into byte array 0, sets up
+/* Driver for code compiled from L (ConAgua/X86/Compiler): loads a file into byte array 0, sets up
    the descriptor table (L.Compiler.Tab with nb = 1, nw = 0, and the program's constant data
    ca_rom) and an L stack, and calls ca_enter(T, fuel).
 

@@ -48,12 +48,12 @@ ALLOW = os.path.join(ROOT, "scripts", "shake-allowlist.txt")
 KEEP = os.path.join(ROOT, "scripts", "shake-keep.txt")
 # top modules that cannot be loaded with the others (`L.Arena.bv` is declared in both
 # `Arena/LiftBench.lean` and `Arena/NatBits.lean`); the modules only they reach are not checked
-JOINT_SEPARATE = {"ConAgua.Compiler.WFAllBench"}
+JOINT_SEPARATE = {"ConAgua.X86.Compiler.WFAllBench"}
 IMP = re.compile(r"^(?:public\s+)?(?:meta\s+)?import\s+(?:all\s+)?([\w.]+)\s*$", re.M)
 
 
 def src(m):
-    return os.path.join(ROOT, "ConAgua.lean" if m == "ConAgua" else m.replace(".", "/") + ".lean")
+    return os.path.join(ROOT, m.replace(".", "/") + ".lean")
 
 
 def header_imports(m):
@@ -72,7 +72,7 @@ def header_imports(m):
 
 
 def default_build():
-    """The ConAgua/ConAguaAsm modules the default targets build."""
+    """The ConAgua/ConAguaX86/ConAguaAsm modules the default targets build."""
     t = tomllib.load(open(os.path.join(ROOT, "lakefile.toml"), "rb"))
     files = set()
     for top in ("ConAgua", "ConAguaAsm"):
@@ -81,9 +81,11 @@ def default_build():
                 if f.endswith(".lean"):
                     files.add(os.path.relpath(os.path.join(dp, f), ROOT)[:-5].replace("/", "."))
     files.add("ConAgua")
+    if os.path.isfile(os.path.join(ROOT, "ConAguaX86.lean")):
+        files.add("ConAguaX86")
     listed = set()
     for lib in t.get("lean_lib", []):
-        if lib["name"] in ("ConAgua", "ConAguaAsm"):
+        if lib["name"] in ("ConAgua", "ConAguaX86", "ConAguaAsm"):
             listed |= set(lib.get("roots", [lib["name"]])) | set(lib.get("globs", []))
     listed |= {f for g in list(listed) if g.endswith(".+") for f in files if f.startswith(g[:-1])}
     reach, stack, imps = set(), [m for m in listed if m in files], {}
@@ -122,7 +124,7 @@ def run_tool():
     keep = set()
     if os.path.exists(KEEP):
         keep = {l.split("#")[0].strip() for l in open(KEEP)} - {""}
-    only = sorted(closure(imps, joint) - keep - {"ConAgua"})
+    only = sorted(closure(imps, joint) - keep - {"ConAgua", "ConAguaX86"})
     args = []
     for m in only:
         args += ["--only", m]
@@ -145,7 +147,7 @@ ATTR_MODULES = {"ConAgua.Arena.GrindAttr", "ConAgua.L.GrindAttr", "ConAgua.Arena
 
 def checked(item):
     mod = item.split()[-1]
-    return mod.split(".")[0] in ("ConAgua", "ConAguaAsm") and mod not in ATTR_MODULES and " meta " not in f" {item} "
+    return mod.split(".")[0] in ("ConAgua", "ConAguaX86", "ConAguaAsm") and mod not in ATTR_MODULES and " meta " not in f" {item} "
 
 
 def proposals(out):

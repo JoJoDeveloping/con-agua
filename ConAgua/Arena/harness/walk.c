@@ -1,4 +1,4 @@
-/* Driver for the compiled walk (ConAgua/Arena/WalkEmit.lean): sets up the descriptor table
+/* Driver for the compiled walk (ConAgua/X86/Arena/WalkEmit.lean): sets up the descriptor table
    (L.Compiler.Tab with nb = 0, nw = NW = 41) over the arena layout of ConAgua/Arena/ArenaRel.lean,
    all arrays zero, and calls ca_enter(T, fuel) on bb_bench(n, k).
 

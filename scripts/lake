@@ -65,7 +65,7 @@ def subcommand(args):
 # time (Lake `input_file`s, `include_asm`), and the source directory of the library that `needs`
 # them: a change to such a file during a build invalidates every module of that library (lane
 # asmfile).
-INPUT_DIRS = {"checker.s": "ConAguaAsm"}
+INPUT_DIRS = {"x86/checker.s": "ConAguaAsm"}
 
 
 def snapshot(root):
@@ -75,14 +75,15 @@ def snapshot(root):
         dn[:] = [d for d in dn if d not in (".lake", "_tmp", ".git")]
         for f in fn:
             p = os.path.join(dp, f)
-            top = os.path.relpath(p, root).split(os.sep)[0]
+            rel = os.path.relpath(p, root)
+            top = rel.split(os.sep)[0]
             if f.endswith(".lean") or f in ("lakefile.toml", "lakefile.lean",
-                                            "lean-toolchain") or top in INPUT_DIRS:
+                                            "lean-toolchain") or rel in INPUT_DIRS or top in INPUT_DIRS:
                 try:
                     st = os.stat(p)
                 except FileNotFoundError:
                     continue
-                snap[os.path.relpath(p, root)] = (st.st_mtime_ns, st.st_size)
+                snap[rel] = (st.st_mtime_ns, st.st_size)
     return snap
 
 
@@ -90,8 +91,9 @@ def invalidate(root, rel):
     """Delete Lake's local state (trace, outputs, .hash files) for the module whose source is `rel`
     (for an input file: for every module of the library that reads it)."""
     top = rel.split(os.sep)[0]
-    if top in INPUT_DIRS:
-        for dp, dn, fn in os.walk(os.path.join(root, INPUT_DIRS[top])):
+    key = rel if rel in INPUT_DIRS else (top if top in INPUT_DIRS else None)
+    if key is not None:
+        for dp, dn, fn in os.walk(os.path.join(root, INPUT_DIRS[key])):
             for f in fn:
                 if f.endswith(".lean"):
                     invalidate(root, os.path.relpath(os.path.join(dp, f), root))

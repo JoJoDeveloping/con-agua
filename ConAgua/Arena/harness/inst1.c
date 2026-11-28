@@ -1,4 +1,4 @@
-/* Driver for the compiled instantiate1 benchmark (ConAgua/Arena/Inst1Emit.lean): sets up the
+/* Driver for the compiled instantiate1 benchmark (ConAgua/X86/Arena/Inst1Emit.lean): sets up the
    descriptor table (L.Compiler.Tab with nb = 0, nw = NW = 48, the full layout through the
    derived-range arrays and both memos), all arrays zero, and calls ca_enter(T, fuel) on
    inst1_bench(n, k, val, d). `harness/lift.c`'s shape exactly, one array wider.
