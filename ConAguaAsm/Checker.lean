@@ -1,7 +1,7 @@
 module
 
-public import ConAgua.AsmFile.Include
-meta import ConAgua.AsmFile.Include
+public import ConAgua.X86.AsmFile.Include
+meta import ConAgua.X86.AsmFile.Include
 
 @[expose] public section
 
@@ -19,7 +19,7 @@ to the compiler's output. This module is in the library `ConAguaAsm`, which `nee
 
 namespace L.Checker
 
-/-- **The checker's code**: the `.text` section of `checker.s`. -/
-noncomputable def checkerFile : Program := include_asm "../checker.s"
+/-- **The checker's code**: the `.text` section of `x86/checker.s`. -/
+noncomputable def checkerFile : Program := include_asm "../x86/checker.s"
 
 end L.Checker

@@ -48,7 +48,7 @@ ELAB_JOBS = 4  # elaborations at once (each Lean with LEAN_NUM_THREADS=4)
 
 
 def is_module(rel):
-    return rel.endswith(".lean") and (rel == "ConAgua.lean" or rel.split("/")[0] in TOPS)
+    return rel.endswith(".lean") and (rel in ("ConAgua.lean", "ConAguaX86.lean") or rel.split("/")[0] in TOPS)
 
 
 def store_path(root, dep_hash):
@@ -176,7 +176,8 @@ def main():
     if args[:1] == ["--all"]:
         files = sorted(os.path.relpath(os.path.join(dp, f), ROOT)
                        for top in TOPS for dp, dn, fn in os.walk(os.path.join(ROOT, top))
-                       for f in fn if f.endswith(".lean")) + ["ConAgua.lean"]
+                       for f in fn if f.endswith(".lean")) + [
+            r for r in ("ConAgua.lean", "ConAguaX86.lean") if os.path.isfile(os.path.join(ROOT, r))]
     elif args[:1] == ["--base"] or not args:
         import gate_select
         files = gate_select.changed_paths(args[1] if args else None)

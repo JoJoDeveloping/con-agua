@@ -1,4 +1,4 @@
-/* Driver for the compiled lift benchmark (ConAgua/Arena/LiftEmit.lean): sets up the descriptor
+/* Driver for the compiled lift benchmark (ConAgua/X86/Arena/LiftEmit.lean): sets up the descriptor
    table (L.Compiler.Tab with nb = 0, nw = NW = 47, the full layout through the derived-range
    arrays and the lift memo), all arrays zero, and calls ca_enter(T, fuel) on
    lift_bench(n, k, shift, cutoff). `harness/walk.c`'s shape exactly, with two more arguments and

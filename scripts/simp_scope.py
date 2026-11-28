@@ -151,6 +151,8 @@ def main() -> int:
             mods += [os.path.relpath(os.path.join(dp, f), ROOT)[:-5].replace(os.sep, ".")
                      for f in fs if f.endswith(".lean")]
         mods.append("ConAgua")
+        if os.path.isfile(os.path.join(ROOT, "ConAguaX86.lean")):
+            mods.append("ConAguaX86")
         # the built ones (a module that no target builds, `modules_unbuilt.txt`, has no olean)
         olean = os.path.join(ROOT, ".lake", "build", "lib", "lean")
         mods = [x for x in sorted(mods) if os.path.exists(os.path.join(olean, *x.split(".")) + ".olean")]

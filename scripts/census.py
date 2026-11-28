@@ -314,7 +314,7 @@ def modules_to_scan():
     cfg = tomllib.load(open(os.path.join(ROOT, "lakefile.toml"), "rb"))
     mods = []
     for lib in cfg.get("lean_lib", []):
-        if lib["name"] == "ConAgua":
+        if lib["name"] in ("ConAgua", "ConAguaX86"):
             mods += lib.get("roots", ["ConAgua"]) + lib.get("globs", [])
     seen = set()
     out = []

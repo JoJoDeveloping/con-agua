@@ -6,7 +6,7 @@ want=$(/home/joachim/p/con-agua/_tmp/leafgen/base.bin $FX | head -1)
 while [ $((hi - lo)) -gt 1 ]; do
   mid=$(( (lo + hi) / 2 ))
   scripts/lake env lean --run scripts/leafgen/LGEmit.lean /home/joachim/p/con-agua/_tmp/leafgen/bis.s "$FL" $lo $mid >/dev/null 2>&1
-  cc -O2 -o /home/joachim/p/con-agua/_tmp/leafgen/bis.bin /home/joachim/p/con-agua/main.c /home/joachim/p/con-agua/_tmp/leafgen/bis.s 2>/dev/null
+  cc -O2 -I/home/joachim/p/con-agua/commons --embed-dir=/home/joachim/p/con-agua/commons -o /home/joachim/p/con-agua/_tmp/leafgen/bis.bin /home/joachim/p/con-agua/commons/main.c /home/joachim/p/con-agua/_tmp/leafgen/bis.s 2>/dev/null
   got=$(timeout 60 /home/joachim/p/con-agua/_tmp/leafgen/bis.bin $FX | head -1)
   if [ "$got" != "$want" ]; then hi=$mid; else lo=$mid; fi
   echo "range $lo $hi" >&2
